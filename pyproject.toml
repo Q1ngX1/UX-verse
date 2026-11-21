@@ -3,4 +3,4 @@ name = "ux-verse"
 version = "0.1.0"
 description = "Browser foundation for UX evaluation"
 requires-python = ">=3.12"
-dependencies = ["playwright>=1.48,<2", "pydantic>=2,<3"]
+dependencies = ["httpx>=0.28,<1", "playwright>=1.48,<2", "pydantic>=2,<3"]

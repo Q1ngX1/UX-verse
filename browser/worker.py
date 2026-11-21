@@ -5,7 +5,7 @@ from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 from time import monotonic
-from typing import TextIO
+from typing import TextIO, TypedDict
 from urllib.parse import urlsplit
 
 from playwright.async_api import ConsoleMessage, Error, Page, Response, Route, WebSocketRoute, async_playwright
@@ -16,6 +16,12 @@ from .actions import MAX_STEPS, Action, Back, Click, Hover, Navigate, Scroll, Wa
 VIEWPORT = {"width": 1280, "height": 720}
 ACTION_TIMEOUT = 10
 RUN_TIMEOUT = 90
+
+
+class PageObservation(TypedDict):
+    url: str
+    title: str
+    screenshot: str
 
 
 def origin(url: str) -> tuple[str, str | None, int | None]:
@@ -62,7 +68,7 @@ class BrowserWorker:
         if response.status >= 400:
             self._record("http_error", url=response.url, status=response.status)
 
-    async def _observe(self, step: int) -> dict[str, object]:
+    async def _observe(self, step: int) -> PageObservation:
         page = self._page
         image = await page.screenshot(scale="css")
         title = await page.title()
@@ -99,7 +105,7 @@ class BrowserWorker:
             case Wait(ms=ms):
                 await asyncio.sleep(ms / 1000)
 
-    async def execute(self, action: Action) -> dict[str, object]:
+    async def execute(self, action: Action) -> PageObservation:
         async with self._lock:
             if self._step >= MAX_STEPS:
                 raise ValueError(f"A run is limited to {MAX_STEPS} actions.")
