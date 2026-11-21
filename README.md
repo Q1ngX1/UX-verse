@@ -219,6 +219,22 @@ By default, each run writes to a new directory under `runs/`. Use `--output` to 
 | `trace.zip` | 用 Playwright Trace Viewer 查看浏览器轨迹。 Browser trace for the Playwright Trace Viewer. |
 | `agent.jsonl` | Agent 运行的决策、模型请求、模型 ID、用量和停止原因，关联观测截图。 Explorer decisions, requests, model IDs, usage, and stop reasons linked to observation screenshots. |
 
+### 关联运行事件 / Correlate run events
+
+[`run_events.py`](run_events.py) 为每次运行的两份 JSONL 日志加上同一个 `run_id`、跨文件连续的 `seq`、事件来源 `source`、UTC `timestamp` 和 `schema_version`。合并同一 `run_id` 的日志后按 `seq` 排序即可查看写入顺序。单独运行浏览器命令时，也会生成自己的运行 ID。
+
+`run_events.py` adds a shared `run_id`, a sequence number `seq` that spans both files, a `source`, a UTC `timestamp`, and a `schema_version`. Merge records with the same `run_id` and sort by `seq` to recover write order. Standalone browser runs get their own run ID.
+
+| 字段 / Field | 如何关联 / How to join |
+| --- | --- |
+| `decision_id` | 同一次决策的模型请求、重试和结果共享该 ID。 Model requests, retries, and the result for one decision share this ID. |
+| `action_id` | 将已接受的 Agent 动作与 Worker 记录的实际执行关联起来。浏览器诊断在动作执行窗口内也会带上该 ID。 Links an accepted Agent action to its browser execution. Browser diagnostics within that action window also carry this ID. |
+| `observation_id` | `model_requested` 引用模型看到的观测。浏览器动作的 `before_observation_id` 指向上一张截图，成功动作的 `observation` 含新 ID 和截图路径。 `model_requested` references the model input. A browser action's `before_observation_id` points to the previous screenshot, and a successful action carries the new ID and screenshot path inside `observation`. |
+
+停止决定和超预算的动作提议仍记录为模型决定，浏览器执行记录只对应已派发的动作。初始导航是浏览器动作，第一张截图从这里产生。
+
+Stop decisions and over-budget proposals are recorded as model decisions. Browser execution records correspond to dispatched actions. Initial navigation is a browser action and produces the first screenshot.
+
 ## 验证 / Verify
 
 Waymark 测试站提供响应式路线目录、详情、收藏、FAQ 和模拟联系表单。可以比较正常版与预置问题版，启动命令和复现表见 [`mock/README.md`](mock/README.md)。

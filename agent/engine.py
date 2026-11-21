@@ -1,15 +1,15 @@
 import asyncio
-import json
 from dataclasses import asdict, dataclass, replace
-from datetime import UTC, datetime
 from pathlib import Path
-from typing import Literal, TextIO
+from typing import Literal
+from uuid import uuid4
 
 from playwright.async_api import Error as BrowserError
 from pydantic import BaseModel, ConfigDict, Field, HttpUrl
 
 from browser.actions import MAX_STEPS, Navigate, PointerAction
 from browser.worker import RUN_TIMEOUT, VIEWPORT, BrowserWorker, PageObservation, browser_worker
+from run_events import EventSink, RunEvents
 
 from .model import (
     DECISION,
@@ -51,23 +51,26 @@ class AgentResult:
 
 
 class _Run:
-    def __init__(self, config: AgentConfig, model: ExplorerModel, output: Path, log: TextIO) -> None:
+    def __init__(self, config: AgentConfig, model: ExplorerModel, output: Path, emit: EventSink) -> None:
         self.config = config
         self.model = model
         self.output = output
-        self.log = log
+        self.record = emit
         self.steps = 0
         self.model_calls = 0
 
-    def record(self, event: str, **fields: object) -> None:
-        row = {"event": event, "timestamp": datetime.now(UTC).isoformat(), **fields}
-        self.log.write(json.dumps(row, ensure_ascii=False) + "\n")
-        self.log.flush()
-
-    async def decide(self, request: DecisionRequest, page: PageObservation) -> Decision:
+    async def decide(
+        self, request: DecisionRequest, page: PageObservation, *, decision_id: str, action_id: str,
+    ) -> Decision:
         for attempt in (1, 2):
             self.model_calls += 1
-            fields = {"call": self.model_calls, "attempt": attempt, "after_steps": self.steps}
+            fields: dict[str, object] = {
+                "call": self.model_calls,
+                "attempt": attempt,
+                "after_steps": self.steps,
+                "decision_id": decision_id,
+                "observation_id": page["observation_id"],
+            }
             self.record("model_requested", **fields, observation=page)
             try:
                 async with asyncio.timeout(self.config.model_timeout_seconds):
@@ -97,6 +100,8 @@ class _Run:
                     self.record("invalid_decision", **fields, error=type(error).__name__, usage=usage)
                     feedback = "Return a decision matching the schema, with any pointer inside the screenshot."
                 else:
+                    if isinstance(decision, Act) and request.steps_remaining > 0:
+                        fields["action_id"] = action_id
                     self.record("model_decision", **fields, decision=decision.model_dump(mode="json"), usage=usage)
                     return decision
             request = replace(request, retry_feedback=feedback)
@@ -123,13 +128,14 @@ class _Run:
                 history=tuple(history),
                 steps_remaining=remaining,
             )
-            decision = await self.decide(request, page)
+            decision_id, action_id = uuid4().hex, uuid4().hex
+            decision = await self.decide(request, page, decision_id=decision_id, action_id=action_id)
             if isinstance(decision, Stop):
                 return decision.outcome, decision.reason
             if remaining == 0:
                 return "step_limit", "The action budget was exhausted."
             self.steps += 1
-            page = await worker.execute(decision.action)
+            page = await worker.execute(decision.action, action_id=action_id, decision_id=decision_id)
             history.append(HistoryEntry(decision.action, page["url"], page["title"]))
 
 
@@ -137,9 +143,10 @@ async def run_agent(
     config: AgentConfig, model: ExplorerModel, output: Path, *, headed: bool = False,
 ) -> AgentResult:
     """Run one Explorer in its own browser session and write the decision and browser logs."""
-    async with browser_worker(config.target, output, headed=headed) as worker:
-        with (output / "agent.jsonl").open("x", encoding="utf-8") as log:
-            run = _Run(config, model, output, log)
+    events = RunEvents()
+    async with browser_worker(config.target, output, headed=headed, events=events) as worker:
+        with events.open_log(output / "agent.jsonl", source="agent") as emit:
+            run = _Run(config, model, output, emit)
             run.record("run_started", config=config.model_dump(mode="json"))
             try:
                 async with asyncio.timeout(config.timeout_seconds):

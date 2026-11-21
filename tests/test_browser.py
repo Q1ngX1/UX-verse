@@ -127,6 +127,9 @@ class BrowserSmokeTest(LocalSite, unittest.TestCase):
             actions = [event for event in self.events(output) if event["event"] == "action"]
             self.assertEqual([event["status"] for event in actions], ["ok", "failed"])
             self.assertEqual(actions[-1]["error"]["type"], "ValueError")
+            self.assertNotEqual(actions[0]["action_id"], actions[1]["action_id"])
+            self.assertEqual(actions[1]["before_observation_id"], actions[0]["observation"]["observation_id"])
+            self.assertNotIn("observation", actions[1])
             self.assertTrue((output / "screenshots" / "001.png").is_file())
             self.assertTrue(zipfile.is_zipfile(output / "trace.zip"))
 
@@ -161,8 +164,26 @@ class AgentSmokeTest(LocalSite, unittest.IsolatedAsyncioTestCase):
                 result = await run_agent(config, model, output)
             self.assertEqual((result.status, result.steps, result.model_calls), ("completed", 1, 2))
             self.assertEqual(calls[-1]["history"][0]["url"], self.url + "next")
-            decisions = [event for event in self.events(output, "agent.jsonl") if event["event"] == "model_decision"]
+            agent_events = self.events(output, "agent.jsonl")
+            browser_events = self.events(output)
+            timeline = sorted(agent_events + browser_events, key=lambda event: event["seq"])
+            self.assertEqual({event["run_id"] for event in timeline}, {timeline[0]["run_id"]})
+            self.assertEqual({event["source"] for event in agent_events}, {"agent"})
+            self.assertEqual({event["source"] for event in browser_events}, {"browser"})
+            self.assertEqual([event["seq"] for event in timeline], list(range(1, len(timeline) + 1)))
+
+            decisions = [event for event in agent_events if event["event"] == "model_decision"]
             self.assertEqual([event["model_id"] for event in decisions], ["decision-model-resolved"] * 2)
+            navigate, click = [event for event in browser_events if event["event"] == "action"]
+            decision, stop = decisions
+            self.assertNotIn("decision_id", navigate)
+            self.assertEqual(decision["action_id"], click["action_id"])
+            self.assertEqual(decision["decision_id"], click["decision_id"])
+            self.assertEqual(decision["observation_id"], click["before_observation_id"])
+            self.assertEqual(decision["observation_id"], navigate["observation"]["observation_id"])
+            self.assertEqual(stop["observation_id"], click["observation"]["observation_id"])
+            self.assertNotIn("action_id", stop)
+            self.assertTrue((output / click["observation"]["screenshot"]).is_file())
 
     async def test_explorer_observes_executes_and_completes_at_step_limit(self):
         requests: list[DecisionRequest] = []
@@ -220,7 +241,15 @@ class AgentSmokeTest(LocalSite, unittest.IsolatedAsyncioTestCase):
             self.assertIsNone(requests[2].retry_feedback)
             actions = [event["action"]["type"] for event in self.events(output) if event["event"] == "action"]
             self.assertEqual(actions, ["navigate", "wait"])
-            self.assertIn("invalid_decision", {event["event"] for event in self.events(output, "agent.jsonl")})
+            agent_events = self.events(output, "agent.jsonl")
+            rejected = next(event for event in agent_events if event["event"] == "invalid_decision")
+            accepted, over_budget = [event for event in agent_events if event["event"] == "model_decision"]
+            self.assertEqual((rejected["attempt"], accepted["attempt"]), (1, 2))
+            self.assertEqual(rejected["decision_id"], accepted["decision_id"])
+            self.assertEqual(rejected["observation_id"], accepted["observation_id"])
+            self.assertNotEqual(accepted["decision_id"], over_budget["decision_id"])
+            self.assertNotIn("action_id", rejected)
+            self.assertNotIn("action_id", over_budget)
 
     async def test_run_timeout_preserves_browser_evidence(self):
         class SlowModel:

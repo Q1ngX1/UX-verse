@@ -1,15 +1,16 @@
 import asyncio
-import json
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from datetime import UTC, datetime
 from pathlib import Path
 from time import monotonic
-from typing import TextIO, TypedDict
+from typing import TypedDict
 from urllib.parse import urlsplit
+from uuid import uuid4
 
 from playwright.async_api import ConsoleMessage, Error, Page, Response, Route, WebSocketRoute, async_playwright
 from pydantic import HttpUrl
+
+from run_events import EventSink, RunEvents
 
 from .actions import MAX_STEPS, Action, Back, Click, Hover, Navigate, Scroll, Wait
 
@@ -19,6 +20,7 @@ RUN_TIMEOUT = 90
 
 
 class PageObservation(TypedDict):
+    observation_id: str
     url: str
     title: str
     screenshot: str
@@ -34,19 +36,19 @@ def origin(url: str) -> tuple[str, str | None, int | None]:
 class BrowserWorker:
     """Execute one action at a time and record the resulting browser state."""
 
-    def __init__(self, page: Page, target: HttpUrl, output: Path, log: TextIO) -> None:
+    def __init__(self, page: Page, target: HttpUrl, output: Path, emit: EventSink) -> None:
         self._page = page
         self._origin = origin(str(target))
         self._output = output
-        self._log = log
+        self._emit = emit
         self._step = 0
         self._lock = asyncio.Lock()
         self._deadline = monotonic() + RUN_TIMEOUT
+        self._last_observation_id: str | None = None
+        self._active_action: dict[str, str] = {}
 
     def _record(self, event: str, **fields: object) -> None:
-        row = {"event": event, "timestamp": datetime.now(UTC).isoformat(), **fields}
-        self._log.write(json.dumps(row, ensure_ascii=False) + "\n")
-        self._log.flush()
+        self._emit(event, **self._active_action, **fields)
 
     async def _route(self, route: Route) -> None:
         request = route.request
@@ -79,7 +81,7 @@ class BrowserWorker:
         path = self._output / screenshot
         path.parent.mkdir(exist_ok=True)
         path.write_bytes(image)
-        return {"url": url, "title": title, "screenshot": screenshot}
+        return {"observation_id": uuid4().hex, "url": url, "title": title, "screenshot": screenshot}
 
     async def _perform(self, action: Action) -> None:
         page = self._page
@@ -105,7 +107,9 @@ class BrowserWorker:
             case Wait(ms=ms):
                 await asyncio.sleep(ms / 1000)
 
-    async def execute(self, action: Action) -> PageObservation:
+    async def execute(
+        self, action: Action, *, action_id: str | None = None, decision_id: str | None = None,
+    ) -> PageObservation:
         async with self._lock:
             if self._step >= MAX_STEPS:
                 raise ValueError(f"A run is limited to {MAX_STEPS} actions.")
@@ -115,7 +119,11 @@ class BrowserWorker:
                 "step": self._step,
                 "action": action.model_dump(mode="json"),
                 "before_url": self._page.url,
+                "before_observation_id": self._last_observation_id,
             }
+            self._active_action = {"action_id": action_id or uuid4().hex}
+            if decision_id is not None:
+                self._active_action["decision_id"] = decision_id
             try:
                 remaining = self._deadline - started
                 if remaining <= 0:
@@ -132,19 +140,26 @@ class BrowserWorker:
                     error={"type": type(error).__name__, "message": str(error)},
                 )
                 raise
-            self._record(
-                "action", **fields, status="ok", after_url=state["url"],
-                duration_ms=round((monotonic() - started) * 1000), observation=state,
-            )
-            return state
+            else:
+                self._record(
+                    "action", **fields, status="ok", after_url=state["url"],
+                    duration_ms=round((monotonic() - started) * 1000), observation=state,
+                )
+                self._last_observation_id = state["observation_id"]
+                return state
+            finally:
+                self._active_action = {}
 
 
 @asynccontextmanager
-async def browser_worker(target: HttpUrl, output: Path, *, headed: bool = False) -> AsyncIterator[BrowserWorker]:
+async def browser_worker(
+    target: HttpUrl, output: Path, *, headed: bool = False, events: RunEvents | None = None,
+) -> AsyncIterator[BrowserWorker]:
     if target.username is not None:
         raise ValueError("The target URL must not contain credentials.")
     output.mkdir(parents=True, exist_ok=False)
-    with (output / "actions.jsonl").open("x", encoding="utf-8") as log:
+    run_events = events if events is not None else RunEvents()
+    with run_events.open_log(output / "actions.jsonl", source="browser") as emit:
         async with async_playwright() as playwright:
             browser = await playwright.chromium.launch(headless=not headed)
             try:
@@ -152,7 +167,7 @@ async def browser_worker(target: HttpUrl, output: Path, *, headed: bool = False)
                     viewport=VIEWPORT, accept_downloads=False, service_workers="block",
                 )
                 page = await context.new_page()
-                worker = BrowserWorker(page, target, output, log)
+                worker = BrowserWorker(page, target, output, emit)
                 page.on("console", worker._console_message)
                 page.on("pageerror", lambda error: worker._record("page_error", url=page.url, message=str(error)))
                 context.on("requestfailed", lambda request: worker._record(
