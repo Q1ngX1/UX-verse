@@ -7,6 +7,8 @@ from threading import Lock
 from typing import Protocol
 from uuid import uuid4
 
+from .events import CURRENT_SCHEMA_VERSION, EventRecord, RunEvent, parse_event
+
 
 class EventSink(Protocol):
     def __call__(self, event: str, /, **fields: object) -> None:
@@ -27,18 +29,26 @@ class RunEvents:
             def emit(event: str, /, **fields: object) -> None:
                 with self._lock:
                     header = {
-                        "schema_version": 1,
+                        "schema_version": CURRENT_SCHEMA_VERSION,
                         "run_id": self._run_id,
                         "seq": self._sequence + 1,
                         "source": source,
                         "event": event,
-                        "timestamp": datetime.now(UTC).isoformat(),
+                        "timestamp": datetime.now(UTC),
                     }
                     if fields.keys() & header.keys():
                         raise ValueError("Event fields overlap with the event header.")
-                    line = json.dumps({**header, **fields}, ensure_ascii=False, allow_nan=False)
+                    record = RunEvent.model_validate({**header, **fields})
+                    line = json.dumps(record.model_dump(exclude_unset=True), ensure_ascii=False, allow_nan=False)
                     stream.write(line + "\n")
                     self._sequence += 1
                     stream.flush()
 
             yield emit
+
+
+def read_log(path: Path) -> Iterator[EventRecord]:
+    with path.open(encoding="utf-8") as stream:
+        for line in stream:
+            if line.strip():
+                yield parse_event(line)

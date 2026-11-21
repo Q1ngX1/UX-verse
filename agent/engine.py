@@ -5,11 +5,11 @@ from typing import Literal
 from uuid import uuid4
 
 from playwright.async_api import Error as BrowserError
-from pydantic import BaseModel, ConfigDict, Field, HttpUrl
+from pydantic import BaseModel, ConfigDict, Field, HttpUrl, ValidationError
 
 from browser.actions import MAX_STEPS, Navigate, PointerAction
 from browser.worker import RUN_TIMEOUT, VIEWPORT, BrowserWorker, PageObservation, browser_worker
-from run_events import EventSink, RunEvents
+from logs import EventSink, RunEvents
 
 from .model import (
     DECISION,
@@ -78,9 +78,13 @@ class _Run:
                 if not isinstance(reply, ModelReply):
                     raise ModelError("The adapter must return ModelReply.")
             except (RetryableModelError, TimeoutError) as error:
+                if isinstance(error, ModelError) and error.http_status is not None:
+                    fields["http_status"] = error.http_status
                 self.record("model_error", **fields, error=type(error).__name__)
                 feedback = "The previous model call failed or timed out. Try again."
             except ModelError as error:
+                if error.http_status is not None:
+                    fields["http_status"] = error.http_status
                 self.record("model_error", **fields, error=type(error).__name__)
                 raise
             except Exception as error:
@@ -96,6 +100,15 @@ class _Run:
                         pointer = decision.action
                         if pointer.x >= request.observation.width or pointer.y >= request.observation.height:
                             raise ValueError("Pointer coordinates must be inside the screenshot.")
+                except ValidationError as error:
+                    issues = [
+                        {"location": item["loc"], "type": item["type"]}
+                        for item in error.errors(include_url=False, include_context=False, include_input=False)
+                    ]
+                    self.record("invalid_decision", **fields, error=type(error).__name__, issues=issues, usage=usage)
+                    feedback = "Return a decision matching the schema. Validation errors: " + ", ".join(
+                        f"{'.'.join(map(str, item['location'])) or 'decision'} ({item['type']})" for item in issues
+                    )
                 except ValueError as error:
                     self.record("invalid_decision", **fields, error=type(error).__name__, usage=usage)
                     feedback = "Return a decision matching the schema, with any pointer inside the screenshot."

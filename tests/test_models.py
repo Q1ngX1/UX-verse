@@ -4,7 +4,10 @@ from unittest.mock import patch
 
 import httpx
 
+from agent.model import DECISION, DecisionRequest, HistoryEntry, Observation
+from browser.actions import Click
 from models.contracts import ImageInput, ModelError, ModelUsage, RetryableModelError, VideoInput
+from models.decision import DecisionAdapter, FlatDecision
 from models.responses import ResponsesProvider
 from models.temporal import TemporalAdapter, TimedFrame
 
@@ -24,6 +27,30 @@ def completed(value, model_id="resolved-model"):
 
 
 class ModelIntegrationTest(unittest.IsolatedAsyncioTestCase):
+    async def test_structured_decision_preserves_agent_action_contract(self):
+        def handle(request):
+            payload = json.loads(request.content)
+            self.assertEqual(payload["text"]["format"]["type"], "json_schema")
+            self.assertEqual(payload["provider"], {"require_parameters": True})
+            prompt = json.loads(payload["input"][0]["content"][0]["text"])
+            self.assertEqual(prompt["history"][0]["action"], {"type": "click", "x": 1000, "y": 1000})
+            return completed({
+                "operation": "click", "x": 723, "y": 53, "dx": 0, "dy": 0, "ms": 0,
+                "reason": "Open Routes.",
+            })
+
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handle)) as client:
+            provider = ResponsesProvider(
+                "openrouter", client, api_key="test-key", response_schema=FlatDecision.model_json_schema(),
+            )
+            adapter = DecisionAdapter(provider, "google/gemini-2.5-flash-lite", flat_output=True)
+            observation = Observation("http://localhost/", "Waymark", b"PNG", 1280, 720)
+            history = (HistoryEntry(Click(x=1279, y=719), observation.url, observation.title),)
+            request = DecisionRequest("Open Routes.", None, observation, history, 6)
+            reply = await adapter.decide(request)
+        decision = DECISION.validate_json(reply.decision_json)
+        self.assertEqual(decision.model_dump()["action"], {"type": "click", "x": 925, "y": 38})
+
     async def test_timestamped_frames_go_to_both_providers_in_order(self):
         frames = (TimedFrame(0, ImageInput(b"before")), TimedFrame(250, ImageInput(b"after")))
 
@@ -37,6 +64,7 @@ class ModelIntegrationTest(unittest.IsolatedAsyncioTestCase):
                     self.assertEqual(request.headers["Authorization"], "Bearer test-key")
                     payload = json.loads(request.content)
                     self.assertEqual(payload["model"], "timeline-model")
+                    self.assertEqual(payload["max_output_tokens"], 256)
                     self.assertEqual(payload["text"]["format"], {"type": "json_object"})
                     content = payload["input"][0]["content"]
                     self.assertEqual(json.loads(content[0]["text"])["timestamps_ms"], [0, 250])
@@ -51,7 +79,7 @@ class ModelIntegrationTest(unittest.IsolatedAsyncioTestCase):
 
                 async with httpx.AsyncClient(transport=httpx.MockTransport(handle)) as client:
                     with patch.dict("os.environ", {f"{name.upper()}_API_KEY": "test-key"}):
-                        adapter = TemporalAdapter(ResponsesProvider(name, client), "timeline-model")
+                        adapter = TemporalAdapter(ResponsesProvider(name, client, max_output_tokens=256), "timeline-model")
                     reply = await adapter.analyze("Check for feedback after clicking.", frames)
                 self.assertEqual(reply.model_id, "resolved-model")
                 self.assertEqual(reply.usage, ModelUsage(30, 10, 0.01))

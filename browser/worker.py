@@ -8,15 +8,17 @@ from urllib.parse import urlsplit
 from uuid import uuid4
 
 from playwright.async_api import ConsoleMessage, Error, Page, Response, Route, WebSocketRoute, async_playwright
+from playwright.async_api import TimeoutError as PlaywrightTimeout
 from pydantic import HttpUrl
 
-from run_events import EventSink, RunEvents
+from logs import EventSink, RunEvents
 
 from .actions import MAX_STEPS, Action, Back, Click, Hover, Navigate, Scroll, Wait
 
 VIEWPORT = {"width": 1280, "height": 720}
 ACTION_TIMEOUT = 10
 RUN_TIMEOUT = 90
+CLICK_NAVIGATION_TIMEOUT_MS = 250
 
 
 class PageObservation(TypedDict):
@@ -72,6 +74,7 @@ class BrowserWorker:
 
     async def _observe(self, step: int) -> PageObservation:
         page = self._page
+        await page.wait_for_load_state("domcontentloaded")
         image = await page.screenshot(scale="css")
         title = await page.title()
         url = page.url
@@ -94,7 +97,14 @@ class BrowserWorker:
                 if x >= VIEWPORT["width"] or y >= VIEWPORT["height"]:
                     raise ValueError("Pointer coordinates are outside the viewport.")
                 if isinstance(action, Click):
+                    before_url = page.url
                     await page.mouse.click(x, y)
+                    try:
+                        await page.wait_for_url(
+                            lambda url: url != before_url, wait_until="commit", timeout=CLICK_NAVIGATION_TIMEOUT_MS,
+                        )
+                    except PlaywrightTimeout:
+                        pass  # Many clicks update only the current page.
                 else:
                     await page.mouse.move(x, y)
             case Scroll(dx=dx, dy=dy):

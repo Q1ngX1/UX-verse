@@ -23,7 +23,10 @@ def _media_part(media: ImageInput | VideoInput) -> dict[str, str]:
 class ResponsesProvider:
     """A shared Responses API transport with a caller-owned async HTTP client."""
 
-    def __init__(self, provider: Provider, client: httpx.AsyncClient, *, api_key: str | None = None) -> None:
+    def __init__(
+        self, provider: Provider, client: httpx.AsyncClient, *, api_key: str | None = None,
+        max_output_tokens: int | None = None, response_schema: dict[str, object] | None = None,
+    ) -> None:
         try:
             self._url, variable = _ENDPOINTS[provider]
         except KeyError:
@@ -31,8 +34,12 @@ class ResponsesProvider:
         self._api_key = (os.getenv(variable, "") if api_key is None else api_key).strip()
         if not self._api_key:
             raise ValueError(f"Provide an API key or set {variable}.")
+        if max_output_tokens is not None and max_output_tokens < 1:
+            raise ValueError("The output token limit must be positive.")
         self._provider = provider
         self._client = client
+        self._max_output_tokens = max_output_tokens
+        self._response_schema = response_schema
 
     async def complete_json(
         self, model_id: str, *, instructions: str, prompt: str, media: tuple[ImageInput | VideoInput, ...],
@@ -51,6 +58,15 @@ class ResponsesProvider:
         }
         if self._provider == "openai":
             payload["store"] = False
+        if self._max_output_tokens is not None:
+            payload["max_output_tokens"] = self._max_output_tokens
+        if self._response_schema is not None:
+            payload["text"] = {"format": {
+                "type": "json_schema", "name": "ux_verse_decision", "strict": True,
+                "schema": self._response_schema,
+            }}
+            if self._provider == "openrouter":
+                payload["provider"] = {"require_parameters": True}
         try:
             response = await self._client.post(
                 self._url, json=payload, headers={"Authorization": f"Bearer {self._api_key}"},
@@ -60,9 +76,9 @@ class ResponsesProvider:
             raise RetryableModelError(f"{self._provider} transport failed ({type(error).__name__}).") from None
         status = response.status_code
         if status in {408, 429} or 500 <= status < 600:
-            raise RetryableModelError(f"{self._provider} returned HTTP {status}.")
+            raise RetryableModelError(f"{self._provider} returned HTTP {status}.", http_status=status)
         if not response.is_success:
-            raise ModelError(f"{self._provider} returned HTTP {status}.")
+            raise ModelError(f"{self._provider} returned HTTP {status}.", http_status=status)
         return self._parse(response, model_id)
 
     def _parse(self, response: httpx.Response, requested_model: str) -> Completion:

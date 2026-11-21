@@ -9,6 +9,7 @@ import unittest
 import zipfile
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from time import sleep
 
 import httpx
 
@@ -28,8 +29,13 @@ class TestSite(BaseHTTPRequestHandler):
             self.send_error(404)
             return
 
+        content_type = "text/html; charset=utf-8"
         if self.path == "/next":
-            body = "<title>Next page</title><h1>Next page</h1>"
+            body = '<title>Loading next page</title><h1></h1><script defer src="/next.js"></script>'
+        elif self.path == "/next.js":
+            sleep(0.2)
+            content_type = "text/javascript; charset=utf-8"
+            body = "document.querySelector('h1').textContent = document.title = 'Next page';"
         else:
             port = self.server.server_port
             body = f"""<!doctype html>
@@ -51,7 +57,7 @@ class TestSite(BaseHTTPRequestHandler):
                 </script>
             """
         self.send_response(200)
-        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Type", content_type)
         self.end_headers()
         self.wfile.write(body.encode())
 

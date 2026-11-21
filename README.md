@@ -134,6 +134,22 @@ Use the worker on local or other trusted, authorized sites. Same-origin request 
 
 Set `OPENAI_API_KEY` or `OPENROUTER_API_KEY` in the environment. Set `UX_VERSE_DECISION_MODEL` to a model ID with image input and JSON output. Pass `DecisionAdapter` to `run_agent`. Custom decision adapters can implement the `ExplorerModel` protocol. `AgentConfig.model_timeout_seconds` controls the per-call model timeout.
 
+打开 Waymark 测试站后，可以用命令行启动一轮 OpenRouter 决策测试。`--max-steps` 限制浏览器动作，`--max-output-tokens` 限制每次模型调用的输出长度。模型调用可能因临时失败或无效响应而重试。
+
+With Waymark running, use the command line to start an OpenRouter decision test. `--max-steps` caps browser actions and `--max-output-tokens` caps each model response. The engine may retry a transient failure or invalid decision.
+
+`--structured-output` 要求模型支持 JSON Schema。模型返回 0–1000 的指针坐标，适配器将其换算为 Playwright 使用的视口像素。滚动距离以像素表示。
+
+`--structured-output` requires JSON Schema support from the model. The adapter converts pointer coordinates on a 0–1000 scale to Playwright viewport pixels. Scroll deltas use pixels.
+
+```sh
+uv run --locked python -m agent http://127.0.0.1:8765/ \
+  --provider openrouter --model google/gemini-2.5-flash-lite \
+  --task "Starting at Waymark's homepage, use the route directory to find and open the route named exactly Fern Creek Loop. On its detail page, read the first sentence under Parking & access. As soon as that sentence is visible, stop and report where to park in your reason." \
+  --persona "First-time visitor checking trailhead parking" \
+  --max-steps 8 --max-output-tokens 256 --structured-output
+```
+
 ```python
 import asyncio
 import os
@@ -221,9 +237,13 @@ By default, each run writes to a new directory under `runs/`. Use `--output` to 
 
 ### 关联运行事件 / Correlate run events
 
-[`run_events.py`](run_events.py) 为每次运行的两份 JSONL 日志加上同一个 `run_id`、跨文件连续的 `seq`、事件来源 `source`、UTC `timestamp` 和 `schema_version`。合并同一 `run_id` 的日志后按 `seq` 排序即可查看写入顺序。单独运行浏览器命令时，也会生成自己的运行 ID。
+[`logs/`](logs/) 统一定义事件模型与 JSONL 读写。`RunEvents` 为同次运行的两份日志分配同一个 `run_id` 和跨文件连续的 `seq`，以 UTC 记录事件时间。`RunEvent` 校验来源、带时区的时间、版本和关联 ID。合并同一 `run_id` 的日志后按 `seq` 排序即可查看写入顺序。单独运行浏览器命令时，也会生成自己的运行 ID。
 
-`run_events.py` adds a shared `run_id`, a sequence number `seq` that spans both files, a `source`, a UTC `timestamp`, and a `schema_version`. Merge records with the same `run_id` and sort by `seq` to recover write order. Standalone browser runs get their own run ID.
+`logs/` owns the event models and JSONL I/O. `RunEvents` assigns a shared `run_id` and a sequence number `seq` that spans both files, and records timestamps in UTC. `RunEvent` validates the source, timezone-aware timestamp, schema version, and correlation IDs. Merge records with the same `run_id` and sort by `seq` to recover write order. Standalone browser runs get their own run ID.
+
+`logs.read_log(path)` 支持带 `schema_version: 1` 的日志和早期未标版本的日志。早期事件保留已有字段和文件内顺序。新模块可以扩展事件类型和字段，读取时会保留这些附加字段。如果字段含义发生不兼容的变化，增加一个版本并保留对应读取规则。读取未知版本时会明确报错。
+
+`logs.read_log(path)` reads logs with `schema_version: 1` and older unversioned logs. Legacy records retain their fields and order within each file. New modules can add event types and fields, which the reader preserves. Use a new version and retain the appropriate reader when a field changes incompatibly. The reader reports unsupported versions explicitly.
 
 | 字段 / Field | 如何关联 / How to join |
 | --- | --- |
