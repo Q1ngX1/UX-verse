@@ -1,11 +1,12 @@
 import {routes, terrains} from "./routes.js";
+import {configure, homeExtras, catalogExtras, detailExtras, collectionsPage, journalPage, plannerPage, guideExtras, installCompare, syncCompare} from "./explore.js";
 
 const main = document.querySelector("#main");
 const page = document.body.dataset.page;
 const query = new URLSearchParams(window.location.search);
 const issues = query.get("scenario") === "issues";
 const saveKey = "waymark.saved.v1";
-const nav = [["routes.html", "Routes"], ["guide.html", "Field guide"], ["saved.html", "Saved"], ["contact.html", "Contact"]];
+const nav = [["routes.html", "Routes"], ["collections.html", "Collections"], ["journal.html", "Journal"], ["guide.html", "Field guide"], ["saved.html", "Saved"], ["planner.html", "Day planner"], ["contact.html", "Contact"]];
 const routeIndex = new Map(routes.map(route => [route.id, route]));
 
 document.body.classList.toggle("issues", issues);
@@ -34,14 +35,14 @@ function layout() {
   ).join("");
   document.querySelector("#header").innerHTML = `
     <div class="wrap topbar">
-      <a class="brand" href="${link("index.html")}"><span aria-hidden="true" class="mark"></span>Waymark</a>
+      <a class="brand" href="${link("index.html")}"><span aria-hidden="true" class="mark"></span>waymark<span class="brand-dot">.</span></a>
       <button type="button" id="menu" class="button secondary menu" aria-expanded="false" aria-controls="primary">Menu</button>
       <nav id="primary" aria-label="Main navigation">${links}</nav>
     </div>`;
   document.querySelector("#footer").innerHTML = `
     <div class="wrap footer-inner">
-      <div><a class="brand" href="${link("index.html")}"><span aria-hidden="true" class="mark"></span>Waymark</a>
-      <p>Local UX-verse test site · Fictional routes and sample content</p></div>
+      <div><a class="brand" href="${link("index.html")}"><span aria-hidden="true" class="mark"></span>waymark.</a>
+      <p>A little closer to the outdoors.</p><p>Local UX-verse test site · Fictional routes and sample content</p></div>
       <nav aria-label="Footer">${nav.map(([file, label]) => `<a href="${link(file)}">${label}</a>`).join("")}</nav>
     </div>`;
   document.body.insertAdjacentHTML("beforeend", '<div class="notice" role="status" aria-live="polite"></div>');
@@ -55,6 +56,7 @@ function layout() {
       menu.focus();
     }
   });
+  installCompare();
 }
 
 function saveButton(route, full = false) {
@@ -72,6 +74,7 @@ function syncSaved() {
   for (const counter of document.querySelectorAll("[data-count]")) {
     counter.textContent = saved.size ? `(${saved.size})` : "";
   }
+  syncCompare();
 }
 
 let noticeTimer;
@@ -94,7 +97,8 @@ function card(route, returnFilters = "") {
   return `<article class="card">
     ${issues ? image : ""}
     <a class="card-link" href="${link("route.html", data)}" aria-label="${route.name}">${issues ? "" : image}${title}</a>
-    <div class="card-body"><p>${route.teaser}</p><p class="stats">${route.difficulty} · ${route.miles} mi · ${timeLabel(route.minutes)}</p></div>
+    <span class="terrain-badge">${route.terrain}</span>
+    <div class="card-body"><p>${route.teaser}</p><p class="stats"><span class="difficulty ${route.difficulty.toLowerCase()}">${route.difficulty}</span> · ${route.miles} mi · ${timeLabel(route.minutes)}</p><button type="button" class="compare-add" data-compare="${route.id}" aria-label="Compare ${route.name}" aria-pressed="false">Compare ${route.name}</button></div>
     ${saveButton(route)}
   </article>`;
 }
@@ -102,26 +106,29 @@ function card(route, returnFilters = "") {
 function home() {
   main.innerHTML = `
     <section class="wrap hero">
-      <div class="hero-copy"><p class="eyebrow">Bay Area day hikes</p>
+      <div class="hero-copy"><p class="eyebrow"><span class="tiny-sun" aria-hidden="true">✳</span> A day outside, a little closer</p>
         <h1>Find a trail worth the morning.</h1>
-        <p class="lede">A guide to day hikes around the Bay Area, from windy headlands to shaded redwood loops. Pick a route that fits the time you have.</p>
+        <p class="lede">Less screen time. More trail time. Discover thoughtful walks around the Bay Area, from ocean air to the quiet of the forest.</p>
         <form class="hero-search" action="routes.html" method="get">
           <label for="home-search">Find a route</label>
           <div><input id="home-search" type="search" name="q" placeholder="Try coast or redwoods">${issues ? '<input name="scenario" type="hidden" value="issues">' : ""}<button class="button" type="submit">Search</button></div>
         </form>
         <a class="text-link" href="${link("routes.html")}">Browse all routes</a>
+        <div class="hero-footnote"><span aria-hidden="true">⌁</span> Somewhere good is closer than you think.</div>
       </div>
       <figure><img src="${terrains.Coast.image}" alt="${terrains.Coast.alt}" fetchpriority="high">
-        <figcaption><a href="${link("route.html", {id: "cypress-headland"})}">Cypress Headland</a><span>Marin Coast · 4.8 mi</span></figcaption>
+        <span class="photo-stamp">THE WEEKEND<br>IS CALLING</span><figcaption><span>This week’s little escape</span><a href="${link("route.html", {id: "cypress-headland"})}">Cypress Headland</a><span>Marin Coast · 4.8 mi · Moderate</span></figcaption>
       </figure>
     </section>
+    <div class="trail-strip"><div class="wrap"><span>Go at your own pace</span><span>15 routes to wander</span><span>Coast, forest & city</span><span>Made for a day outside</span></div></div>
     <section class="wrap section">
       <div class="section-title"><div><h2>Explore by terrain</h2><p>Choose the scenery that suits your day.</p></div></div>
-      <div class="terrain-list">${Object.entries(terrains).map(([name, info]) => `<a href="${link("routes.html", {terrain: name})}"><strong>${name}</strong><span>${info.copy}</span></a>`).join("")}</div>
+      <div class="terrain-list">${Object.entries(terrains).map(([name, info]) => `<a href="${link("routes.html", {terrain: name})}"><img src="${info.image}" alt="" loading="lazy"><span class="terrain-icon" aria-hidden="true">${{Coast:"≈",Forest:"♧",Urban:"⌂"}[name]}</span><strong>${name}</strong><span>${info.copy}</span><small>${routes.filter(route => route.terrain === name).length} routes to explore</small></a>`).join("")}</div>
     </section>
     <section class="wrap section"><div class="section-title"><h2>Featured routes</h2><a class="text-link" href="${link("routes.html")}">See all routes</a></div>
       <div class="grid">${routes.slice(0, 3).map(route => card(route)).join("")}</div>
     </section>`;
+  homeExtras();
 }
 
 function catalog() {
@@ -147,7 +154,9 @@ function catalog() {
       const searchable = `${route.name} ${route.area} ${route.terrain} ${route.teaser} ${route.description}`.toLowerCase();
       return (!terrain.value || route.terrain === terrain.value)
         && (!difficulty.value || route.difficulty === difficulty.value)
-        && terms.every(term => searchable.includes(term));
+        && terms.every(term => searchable.includes(term))
+        && (!form.elements.duration?.value || route.minutes <= Number(form.elements.duration.value))
+        && (!form.elements.facility?.value || route.facilities.includes(form.elements.facility.value));
     });
     if (sort.value === "shortest") matches.sort((a, b) => a.miles - b.miles);
     if (sort.value === "longest") matches.sort((a, b) => b.miles - a.miles);
@@ -156,14 +165,19 @@ function catalog() {
     if (terrain.value) filters.set("terrain", terrain.value);
     if (difficulty.value) filters.set("difficulty", difficulty.value);
     if (sort.value !== "featured") filters.set("sort", sort.value);
+    if (form.elements.duration?.value) filters.set("duration", form.elements.duration.value);
+    if (form.elements.facility?.value) filters.set("facility", form.elements.facility.value);
+    if (document.querySelector('[data-view="map"][aria-pressed="true"]')) filters.set("view", "map");
     if (changeURL) history.replaceState(null, "", link("routes.html", filters));
     document.querySelector("#result-count").textContent = `${matches.length} ${matches.length === 1 ? "route" : "routes"}`;
     document.querySelector("#results").innerHTML = matches.length
       ? matches.map(route => card(route, filters.toString())).join("")
       : '<div class="empty"><h2>No matching routes</h2><p>Try a broader search or clear a filter.</p></div>';
     syncSaved();
+    document.dispatchEvent(new CustomEvent("waymark:results", {detail: {matches, filters: filters.toString()}}));
   }
 
+  catalogExtras(form, () => update(true));
   for (const control of form.querySelectorAll("input, select")) {
     if (query.has(control.name)) control.value = query.get(control.name);
     if (control.name === "sort" && !control.value) control.value = "featured";
@@ -177,6 +191,12 @@ function catalog() {
     update(true);
   });
   update(false);
+  window.addEventListener("popstate", () => {
+    form.reset();
+    const state = new URLSearchParams(location.search);
+    for (const control of form.querySelectorAll("input, select")) if (state.has(control.name)) control.value = state.get(control.name);
+    update(false);
+  });
 }
 
 function detail() {
@@ -224,11 +244,13 @@ function detail() {
   for (const button of tabs) button.addEventListener("click", () => show(issues && button.dataset.tab === "access" ? "gear" : button.dataset.tab));
   document.querySelector("#photo-button").addEventListener("click", () => document.querySelector("#photo").showModal());
   show("overview");
+  detailExtras(route);
 }
 
 function savedPage() {
   const collection = routes.filter(route => saved.has(route.id));
   main.innerHTML = `<section class="wrap section"><h1 tabindex="-1">Saved routes</h1><p class="lede">Keep a shortlist for your next day outside.</p>
+    ${collection.length ? `<div class="saved-summary"><span>${collection.length} saved · ${collection.reduce((n, r) => n + r.miles, 0).toFixed(1)} miles of possibility</span><a class="button secondary" href="${link("planner.html")}">Build a day plan</a></div>` : ""}
     ${collection.length ? `<div class="grid">${collection.map(route => card(route)).join("")}</div>` : `<div class="empty"><h2>No routes saved yet</h2><p>Save a route from the directory or from its detail page.</p><a class="button" href="${link("routes.html")}">Browse routes</a></div>`}</section>`;
 }
 
@@ -245,6 +267,7 @@ function guide() {
     <p><a class="text-link" href="${link("contact.html")}">Report a problem with a route</a></p></div>
     <aside class="guide-card"><img src="${terrains.Forest.image}" alt="${terrains.Forest.alt}" loading="lazy"><h2>Take the shaded route</h2><p>Redwood loops offer a cooler option on warm afternoons.</p><a class="text-link" href="${link("routes.html", {terrain: "Forest"})}">Find forest routes</a></aside>
     </section>`;
+  guideExtras();
 }
 
 function contact() {
@@ -274,8 +297,9 @@ function contact() {
   });
 }
 
+configure({main, link, card, timeLabel, syncSaved, notify});
 layout();
-({home, routes: catalog, detail, saved: savedPage, guide, contact})[page]();
+({home, routes: catalog, detail, saved: savedPage, guide, contact, collections: collectionsPage, journal: journalPage, planner: plannerPage})[page]();
 syncSaved();
 
 main.addEventListener("click", event => {

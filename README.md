@@ -113,9 +113,9 @@ uv run --locked playwright install chromium
 uv run --locked python -m browser https://example.com
 ```
 
-用 `--actions actions.json` 提供初始导航后的动作列表。支持 `navigate`（`url`）、`click` 和 `hover`（`x`、`y`）、`scroll`（`dx`、`dy`）、`back` 和 `wait`（`ms`）。指针坐标以截图左上角为原点，单位为 CSS 像素。用 `--headed` 可以看到浏览器窗口。
+用 `--actions actions.json` 提供初始导航后的动作列表。支持 `navigate`（`url`）、`click` 和 `hover`（`x`、`y`）、`type`（`x`、`y`、`text`）、`scroll`（`dx`、`dy`）、`back` 和 `wait`（`ms`）。`type` 点击指定位置的可编辑输入框，替换内容并触发输入事件，不按回车或提交表单。指针坐标以截图左上角为原点，单位为 CSS 像素。用 `--headed` 可以看到浏览器窗口。
 
-Pass `--actions actions.json` to supply actions after initial navigation. Supported actions are `navigate` (`url`), `click` and `hover` (`x`, `y`), `scroll` (`dx`, `dy`), `back`, and `wait` (`ms`). Pointer coordinates use CSS pixels from the top-left corner of the screenshot. Use `--headed` to show the browser window.
+Pass `--actions actions.json` to supply actions after initial navigation. Supported actions are `navigate` (`url`), `click` and `hover` (`x`, `y`), `type` (`x`, `y`, `text`), `scroll` (`dx`, `dy`), `back`, and `wait` (`ms`). `type` clicks an editable field at the supplied coordinates, replaces its contents, and fires input events without pressing Enter or submitting the form. Pointer coordinates use CSS pixels from the top-left corner of the screenshot. Use `--headed` to show the browser window.
 
 ```json
 [
@@ -129,6 +129,10 @@ Worker 面向本地或其他受信且已授权的站点。同源请求过滤和�
 Use the worker on local or other trusted, authorized sites. Same-origin request filtering and an independent browser session scope each run. Testing untrusted sites requires separate network isolation in the runtime environment.
 
 ## 单 Agent 自主探索 / Single-agent exploration
+
+也可以使用本地视觉模型，无需云端 API key。Hugging Face 权重下载、Windows CUDA 启动与 mock 实测复现步骤见 [本地模型说明](docs/local-model.md)。
+
+Local vision models are also supported without a cloud API key. See [Local model setup](docs/local-model.md) for Hugging Face downloads, Windows CUDA startup, and reproducing the mock-site run.
 
 在环境里设置 `OPENAI_API_KEY` 或 `OPENROUTER_API_KEY`，再通过 `UX_VERSE_DECISION_MODEL` 指定支持图片输入和 JSON 输出的模型 ID。把 `DecisionAdapter` 传给 `run_agent` 即可运行。自定义决策适配器也可以实现 [`ExplorerModel`](agent/model.py) 协议。`AgentConfig.model_timeout_seconds` 控制单次模型调用时限。
 
@@ -178,9 +182,9 @@ async def explore():
 print(asyncio.run(explore()))
 ```
 
-引擎先打开起始页，然后逐轮提交截图、可见页面元数据和动作历史。模型可以建议点击、悬停、滚动、返回或等待，也可以报告完成或放弃。模型输出无效或遇到可重试错误时，每轮可再请求一次。初始导航独立于动作预算，最后一步之后仍可根据最新观测报告完成。`completed` 表示模型报告任务已完成。
+引擎先打开起始页，然后逐轮提交截图、可见页面元数据和动作历史。模型可以建议点击、悬停、输入文字、滚动、返回或等待，也可以报告完成或放弃。文字输入动作包含截图坐标与最多 1000 字符的文本，执行器仅检查目标是否可编辑，不向模型返回 DOM 内容。模型输出无效或遇到可重试错误时，每轮可再请求一次。初始导航独立于动作预算，最后一步之后仍可根据最新观测报告完成。`completed` 表示模型报告任务已完成。
 
-The engine opens the start page, then supplies each turn with a screenshot, visible page metadata, and action history. The model can propose a click, hover, scroll, back, or wait, or report completion or abandonment. An invalid response or retryable error allows one retry per turn. Initial navigation is outside the action budget, and the model can still report completion after observing the final permitted action. `completed` means the model reported task completion.
+The engine opens the start page, then supplies each turn with a screenshot, visible page metadata, and action history. The model can propose a click, hover, text entry, scroll, back, or wait, or report completion or abandonment. Text entry includes screenshot coordinates and up to 1000 characters; the executor checks only target editability and does not return DOM content to the model. An invalid response or retryable error allows one retry per turn. Initial navigation is outside the action budget, and the model can still report completion after observing the final permitted action. `completed` means the model reported task completion.
 
 ### 时序分析与视频 / Temporal and video analysis
 

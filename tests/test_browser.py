@@ -30,7 +30,12 @@ class TestSite(BaseHTTPRequestHandler):
             return
 
         content_type = "text/html; charset=utf-8"
-        if self.path == "/next":
+        if self.path == "/search":
+            body = '''<!doctype html><title>Search fixture</title>
+                <style>body {margin:0} input {position:absolute;left:20px;top:20px;width:300px;height:50px}</style>
+                <form onsubmit="document.title='Unexpected submission';return false">
+                <input type="search" value="Old query" oninput="document.title='Query: '+this.value"></form>'''
+        elif self.path == "/next":
             body = '<title>Loading next page</title><h1></h1><script defer src="/next.js"></script>'
         elif self.path == "/next.js":
             sleep(0.2)
@@ -137,6 +142,34 @@ class BrowserSmokeTest(LocalSite, unittest.TestCase):
             self.assertEqual(actions[1]["before_observation_id"], actions[0]["observation"]["observation_id"])
             self.assertNotIn("observation", actions[1])
             self.assertTrue((output / "screenshots" / "001.png").is_file())
+            self.assertTrue(zipfile.is_zipfile(output / "trace.zip"))
+
+    def test_coordinate_text_entry_replaces_value_and_does_not_submit(self):
+        with tempfile.TemporaryDirectory() as directory:
+            query = 'Fern Creek Loop <literal> "溪流"'
+            process, output = self.run_browser(Path(directory), [
+                {"type": "navigate", "url": self.url + "search"},
+                {"type": "type", "x": 150, "y": 40, "text": query},
+                {"type": "type", "x": 150, "y": 40, "text": "Replacement query"},
+            ])
+            self.assertEqual(process.returncode, 0, process.stderr)
+            actions = [event for event in self.events(output) if event["event"] == "action"]
+            self.assertEqual(actions[-2]["observation"]["title"], "Query: " + query)
+            self.assertEqual(actions[-1]["observation"]["title"], "Query: Replacement query")
+            self.assertEqual(actions[-1]["after_url"], self.url + "search")
+            self.assertEqual(actions[-1]["action"]["text"], "Replacement query")
+            self.assertNotEqual(actions[-2]["observation"]["screenshot"], actions[-1]["observation"]["screenshot"])
+
+    def test_text_entry_rejects_noneditable_target_with_evidence(self):
+        with tempfile.TemporaryDirectory() as directory:
+            process, output = self.run_browser(Path(directory), [
+                {"type": "type", "x": 400, "y": 400, "text": "Query"},
+            ])
+            self.assertEqual(process.returncode, 1)
+            self.assertIn("editable field", process.stderr)
+            last = [event for event in self.events(output) if event["event"] == "action"][-1]
+            self.assertEqual(last["status"], "failed")
+            self.assertEqual(last["error"]["type"], "ValueError")
             self.assertTrue(zipfile.is_zipfile(output / "trace.zip"))
 
 

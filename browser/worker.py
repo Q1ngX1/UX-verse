@@ -13,7 +13,7 @@ from pydantic import HttpUrl
 
 from logs import EventSink, RunEvents
 
-from .actions import MAX_STEPS, Action, Back, Click, Hover, Navigate, Scroll, Wait
+from .actions import MAX_STEPS, Action, Back, Click, Hover, Navigate, Scroll, TypeText, Wait
 
 VIEWPORT = {"width": 1280, "height": 720}
 ACTION_TIMEOUT = 10
@@ -88,14 +88,14 @@ class BrowserWorker:
 
     async def _perform(self, action: Action) -> None:
         page = self._page
+        if isinstance(action, (Click, Hover, TypeText)) and (action.x >= VIEWPORT["width"] or action.y >= VIEWPORT["height"]):
+            raise ValueError("Pointer coordinates are outside the viewport.")
         match action:
             case Navigate(url=url):
                 if url.username is not None or origin(str(url)) != self._origin:
                     raise ValueError("Navigation requires a URL on the target origin without credentials.")
                 await page.goto(str(url), wait_until="domcontentloaded")
             case Click(x=x, y=y) | Hover(x=x, y=y):
-                if x >= VIEWPORT["width"] or y >= VIEWPORT["height"]:
-                    raise ValueError("Pointer coordinates are outside the viewport.")
                 if isinstance(action, Click):
                     before_url = page.url
                     await page.mouse.click(x, y)
@@ -114,6 +114,19 @@ class BrowserWorker:
                 })""")
             case Back():
                 await page.go_back(wait_until="domcontentloaded")
+            case TypeText(x=x, y=y, text=text):
+                await page.mouse.click(x, y)
+                editable = await page.evaluate("""() => {
+                    const element = document.activeElement;
+                    return Boolean(element && !element.disabled && !element.readOnly && (
+                        element.isContentEditable || element.tagName === 'TEXTAREA' ||
+                        element.tagName === 'INPUT' && ['text', 'search', 'email', 'url', 'tel', 'password', 'number'].includes(element.type)
+                    ));
+                }""")
+                if not editable:
+                    raise ValueError("Text entry requires an editable field at the supplied coordinates.")
+                await page.keyboard.press("ControlOrMeta+A")
+                await page.keyboard.insert_text(text)
             case Wait(ms=ms):
                 await asyncio.sleep(ms / 1000)
 

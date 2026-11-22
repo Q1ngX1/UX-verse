@@ -1,0 +1,21 @@
+{
+  "run": "local-qwen3-vl-8b-20261121-04",
+  "reported_status": "completed",
+  "reported_reason": "Parking is beside the picnic area.",
+  "steps": 7,
+  "model_calls": 8,
+  "elapsed_seconds": 15.765,
+  "input_tokens": 15681,
+  "output_tokens": 526,
+  "invalid_decisions": 0,
+  "final_observation": {
+    "observation_id": "5eced1e813ab4b7b86707c1ffd486419",
+    "url": "http://127.0.0.1:8765/route.html?id=fern-creek&from=q%3DFern%2BCreek%2BLoop",
+    "title": "Fern Creek Loop \u00b7 Waymark",
+    "screenshot": "screenshots/008.png"
+  },
+  "browser_action_failures": 0,
+  "task_success": true,
+  "screenshot_review": "verified_parking_answer_visible",
+  "final_screenshot_sha256": "2f60a07321bff88d370dd52c5c92e28cc088d1700861f76a35c9a3b16fd4188e"
+}

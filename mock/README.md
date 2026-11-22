@@ -32,6 +32,41 @@ Internal navigation preserves `scenario=issues`. For comparisons, start separate
 | 用示例信息填写联系表单。 Fill in the contact form with sample details. | 必填校验生效。通过校验后，按钮先显示 `Sending…`，随后出现确认。 Required-field validation runs. A valid submission shows `Sending…`, then a confirmation. |
 | 切换到手机视口，打开菜单并查看详情。 Switch to a phone viewport, open the menu, and view a route. | 移动导航可展开，详情和页脚可以正常浏览。 The mobile menu opens, and both the route and footer remain reachable. |
 
+## 扩展体验 / Extended experience
+
+站点保留无构建依赖的静态架构，现有 15 条虚构路线、4 个专题、3 篇完整示例游记，以及目录、详情、收藏、指南、联系、专题、游记和行程规划共 9 类页面。所有图片均来自本地文件，无地图、字体或分析服务的外部请求。
+
+The site keeps its buildless static architecture, with 15 fictional routes, four collections, three full sample stories, and nine page types: home, directory, detail, saved, guide, contact, collections, journal, and planner. Images are local files; maps, fonts, and analytics require no external services.
+
+| 入口 / Entry | 交互与状态 / Interaction and state |
+| --- | --- |
+| 首页 / Home | 地形与心情推荐、三步路线选择器（可返回修改、显示空结果）、精选路线、专题和游记入口。 Terrain and mood suggestions, a three-step trail finder with backtracking and empty results, featured routes, collections, and stories. |
+| `routes.html` | 实时搜索、地形、难度、步行时间与设施筛选、距离排序、快捷筛选、网格与示意地图切换、地图点选预览。筛选及视图保存在 URL，刷新和详情返回后可恢复。 Live search; terrain, difficulty, walking-time, and facilities filters; distance sorting; quick filters; grid/map switching; and selectable map pins. URL state restores filters and view after reload or return from detail. |
+| 路线比较 / Comparison | 任意路线卡片可选择最多 3 条路线，选择至少 2 条后打开比较表。支持清除、Escape 关闭、键盘焦点恢复。比较选择仅保留在当前页面。 Select up to three routes on cards, then compare at least two in a modal table. Clear selection, Escape dismissal, and focus restoration are supported. Selection lasts for the current page. |
+| `route.html?id=fern-creek` | 原有信息切换和照片弹窗之外，新增示意海拔、沿途站点、设施摘要、私人笔记、示例评论及添加行程。新评论只存本地，用户输入按文本显示。 Adds an illustrative elevation profile, trail stops, amenities, private notes, sample reviews, and a planner link alongside the original panels and photo dialog. New reviews stay local and user input renders as text. |
+| `collections.html` | 专题索引、详情、关联路线、其他专题推荐，以及将整组路线加入日程。 Collection index, details, related routes, other collections, and adding a collection to the planner. |
+| `journal.html` | 分类筛选、完整文章、章节目录、复制文章链接和关联专题。 Category filters, full articles, chapter navigation, copying a story link, and related collections. |
+| `planner.html` | 添加最多 8 条不重复路线、调整顺序、移除、日期与出发时间、累计里程/时间/爬升、备注、确认清空路线、打印和文本下载。行程在此浏览器中持久化。 Add up to eight unique routes, reorder or remove them, set a date and start time, inspect distance/time/gain totals, add notes, confirm clearing routes, print, and download a text itinerary. Plans persist in this browser. |
+| 装备清单 / Packing checklist | 指南与行程页共享 8 项勾选状态、进度与重置操作；下载行程包含当前勾选状态。 The guide and planner share an eight-item checklist, progress indicator, and reset action. The itinerary download includes current checkbox state. |
+
+地图坐标和海拔剖面都是示意数据；日程只累计步行时间，不估算交通或休息。示例评论和文章有演示标识。表单不发送网络请求，行程和评论不跨浏览器同步。
+
+Map positions and elevation profiles are illustrative. Itinerary times sum walking only, excluding transit and breaks. Sample reviews and stories are marked as demo content. Forms send no network requests, and plans and reviews do not sync across browsers.
+
+视觉层沿用 Waymark 的森林绿、衬线标题和本地摄影，扩展了编辑式首页、专题大图、卡片悬停、入场动效与原生对话框。布局覆盖 320px 手机、390px 手机、768px 平板和桌面；开启 `prefers-reduced-motion` 时关闭动画和平滑滚动。桌面比较表在手机上切换为纵向路线摘要，关闭按钮固定在弹窗顶部，主页面不产生横向溢出。
+
+The design extends Waymark’s forest green palette, serif headings, and local photography with an editorial home page, collection photography, card hover states, entrance motion, and native dialogs. Layouts cover 320px and 390px phones, 768px tablets, and desktop. `prefers-reduced-motion` disables animation and smooth scrolling. Desktop comparison tables become stacked route summaries on phones, with the close control pinned to the dialog header and no page overflow.
+
+## 扩展验证 / Extended verification
+
+从仓库根目录运行全部测试（需已安装 Playwright Chromium）。新增测试覆盖筛选与地图状态、比较数量限制与弹窗、专题和游记导航、三步推荐、行程重排与下载、笔记与评论持久化和文本转义，并检查 12 个代表性 URL 在四种宽度下的溢出、图片和浏览器异常。原有 W01–W08 对照测试保留。
+
+Run the full suite from the repository root after installing Playwright Chromium. Added tests cover filter and map state, comparison limits and dialogs, collection/story navigation, the three-step finder, itinerary reordering and download, note/review persistence and text escaping, and overflow, images, and browser exceptions for 12 representative URLs at four widths. Existing W01–W08 comparison tests remain intact.
+
+```sh
+uv run --locked python -m unittest discover -s tests -v
+```
+
 ## 预置问题 / Seeded issues
 
 以下问题只在 `scenario=issues` 生效。这张表可用作比对 Agent 输出的基准。

@@ -1,0 +1,21 @@
+{
+  "run": "local-qwen3-vl-8b-20261121-03",
+  "reported_status": "step_limit",
+  "reported_reason": "The action budget was exhausted.",
+  "steps": 8,
+  "model_calls": 9,
+  "elapsed_seconds": 17.206,
+  "input_tokens": 17102,
+  "output_tokens": 628,
+  "invalid_decisions": 0,
+  "final_observation": {
+    "observation_id": "0ad0b7af49f94bd6884b286425bce0fa",
+    "url": "http://127.0.0.1:8765/routes.html",
+    "title": "Find a route \u00b7 Waymark",
+    "screenshot": "screenshots/009.png"
+  },
+  "browser_action_failures": 0,
+  "task_success": false,
+  "screenshot_review": "failed_unfocused_typing",
+  "final_screenshot_sha256": "e7ff35af2adfc7fcf5b4b8fa13eaaf25e58fe86603fc1ff2921a5b3399c80d2e"
+}

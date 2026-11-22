@@ -31,6 +31,11 @@ class Scroll(BrowserAction):
     dy: int = 0
 
 
+class TypeText(PointerAction):
+    type: Literal["type"] = "type"
+    text: Annotated[str, Field(min_length=1, max_length=1000)]
+
+
 class Back(BrowserAction):
     type: Literal["back"] = "back"
 
@@ -40,6 +45,6 @@ class Wait(BrowserAction):
     ms: Annotated[int, Field(ge=0, le=2000)]
 
 
-Action = Annotated[Navigate | Click | Hover | Scroll | Back | Wait, Field(discriminator="type")]
+Action = Annotated[Navigate | Click | Hover | Scroll | TypeText | Back | Wait, Field(discriminator="type")]
 MAX_STEPS = 30
 ACTION_LIST = TypeAdapter(Annotated[list[Action], Field(max_length=MAX_STEPS - 1)])

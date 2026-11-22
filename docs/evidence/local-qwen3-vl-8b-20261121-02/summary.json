@@ -1,0 +1,13 @@
+{
+  "run": "local-qwen3-vl-8b-20261121-02",
+  "status": "step_limit",
+  "steps": 8,
+  "model_calls": 9,
+  "elapsed_seconds": 17.348,
+  "input_tokens": 16785,
+  "output_tokens": 544,
+  "invalid_decisions": 0,
+  "final_screenshot": "screenshots/009.png",
+  "last_url": "http://127.0.0.1:8765/routes.html",
+  "task_success": false
+}

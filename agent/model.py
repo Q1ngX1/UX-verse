@@ -3,10 +3,10 @@ from typing import Annotated, Literal, Protocol
 
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter
 
-from browser.actions import Back, Click, Hover, Scroll, Wait
+from browser.actions import Back, Click, Hover, Scroll, TypeText, Wait
 from models.contracts import ModelError as ModelError, ModelUsage as ModelUsage, RetryableModelError as RetryableModelError
 
-ExplorerAction = Annotated[Click | Hover | Scroll | Back | Wait, Field(discriminator="type")]
+ExplorerAction = Annotated[Click | Hover | Scroll | TypeText | Back | Wait, Field(discriminator="type")]
 
 
 class DecisionBase(BaseModel):

@@ -11,17 +11,23 @@ import httpx
 from playwright.async_api import Error as BrowserError
 
 from models.decision import DecisionAdapter, FlatDecision
+from models.local import LocalProvider
 from models.responses import ResponsesProvider
 
 from .engine import AgentConfig, AgentResult, run_agent
 
 
 async def _run(args: argparse.Namespace, config: AgentConfig, output: Path, api_key: str | None) -> AgentResult:
-    async with httpx.AsyncClient(timeout=config.model_timeout_seconds) as client:
-        provider = ResponsesProvider(
-            args.provider, client, api_key=api_key, max_output_tokens=args.max_output_tokens,
-            response_schema=FlatDecision.model_json_schema() if args.structured_output else None,
-        )
+    async with httpx.AsyncClient(timeout=config.model_timeout_seconds, trust_env=args.provider != "local") as client:
+        schema = FlatDecision.model_json_schema() if args.structured_output else None
+        if args.provider == "local":
+            provider = LocalProvider(
+                client, base_url=args.base_url, max_output_tokens=args.max_output_tokens, response_schema=schema,
+            )
+        else:
+            provider = ResponsesProvider(
+                args.provider, client, api_key=api_key, max_output_tokens=args.max_output_tokens, response_schema=schema,
+            )
         model = DecisionAdapter(provider, args.model, flat_output=args.structured_output)
         return await run_agent(config, model, output, headed=args.headed)
 
@@ -30,7 +36,8 @@ def main(argv: list[str] | None = None, *, api_key: str | None = None) -> int:
     parser = argparse.ArgumentParser(description="Run a vision-based UX-verse Explorer.")
     parser.add_argument("url", help="Start page on the target origin")
     parser.add_argument("--task", required=True, help="Task for the Explorer")
-    parser.add_argument("--provider", choices=("openrouter", "openai"), default="openrouter")
+    parser.add_argument("--provider", choices=("openrouter", "openai", "local"), default="openrouter")
+    parser.add_argument("--base-url", default="http://127.0.0.1:8081/v1", help="Local model's loopback /v1 URL")
     parser.add_argument("--model", default=os.getenv("UX_VERSE_DECISION_MODEL"), help="Vision model ID")
     parser.add_argument("--persona", help="Visitor profile or behavioral context")
     parser.add_argument("--max-steps", type=int, default=6, help="Maximum actions after initial navigation")

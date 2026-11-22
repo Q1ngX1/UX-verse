@@ -36,7 +36,7 @@ class ModelIntegrationTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(prompt["history"][0]["action"], {"type": "click", "x": 1000, "y": 1000})
             return completed({
                 "operation": "click", "x": 723, "y": 53, "dx": 0, "dy": 0, "ms": 0,
-                "reason": "Open Routes.",
+                "reason": "Open Routes.", "text": "",
             })
 
         async with httpx.AsyncClient(transport=httpx.MockTransport(handle)) as client:
