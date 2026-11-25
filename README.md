@@ -182,39 +182,15 @@ async def explore():
 print(asyncio.run(explore()))
 ```
 
-引擎先打开起始页，然后逐轮提交截图、可见页面元数据和动作历史。模型可以建议点击、悬停、输入文字、滚动、按键、页内查找、返回或等待，也可以报告完成或放弃。文字输入动作包含截图坐标与最多 1000 字符的文本。模型输出无效或遇到可重试错误时，每轮可再请求一次。初始导航独立于动作预算，最后一步之后仍可根据最新观测报告完成。`completed` 表示模型报告任务已完成。
+### 人类输入与截图观测 / Human input and screenshot observations
 
-The engine opens the start page, then supplies each turn with a screenshot, visible page metadata, and action history. The model can propose a click, hover, text entry, scroll, key press, in-page find, back, or wait, or report completion or abandonment. Text entry includes screenshot coordinates and up to 1000 characters. An invalid response or retryable error allows one retry per turn. Initial navigation is outside the action budget, and the model can still report completion after observing the final permitted action. `completed` means the model reported task completion.
+引擎打开调用方指定的起始页后，模型只收到页面视口截图、自己执行过的动作、从截图比较得出的变化，以及任务和预算。模型可以点击、悬停、滚动、逐键输入、按 Tab、Shift+Tab、Escape、上下方向键或 Enter，也可以等待、完成或放弃。连续重复且画面无变化的动作会触发一次改选。输出的 `answer` 和停止理由分别记录。
 
-### 动作反馈与控件提示 / Action feedback and control hints
+After the engine opens the caller's start page, the model receives only the viewport screenshot, its own actions, changes derived by comparing screenshots, and its task and budget. It can click, hover, scroll, type using key events, press Tab, Shift+Tab, Escape, Up, Down or Enter, wait, complete, or give up. Repeated actions with unchanged screenshots can trigger one retry. The reported `answer` and stopping reason are recorded separately.
 
-模型适配器默认带上最近六步动作及其结果，包括 URL、画面和文档滚动位置是否变化，以及可编辑控件是否处于焦点。连续点击无明显变化、滚动无效果或输入未命中时，模型可以依据反馈重新选择动作。浏览器 CLI 仍把无效输入目标作为失败报告。
+Agent 运行入口禁用 DOM 控件和文本提示、自动定位、程序化查找与返回。截图范围是页面视口，浏览器地址栏、原生查找和原生返回尚未接入。文本输入目前支持最多 1000 个可打印 ASCII 字符，由虚拟键盘逐键执行。独立浏览器脚本仍可使用其原有工具。录制、诊断日志和基准验收可保存内部证据，模型决策输入保持截图范围。
 
-The model adapter includes the last six actions and their effects by default, covering URL, screenshot and document scroll changes and whether an editable control is focused. The model can reconsider after repeated clicks, a scroll with no effect, or a rejected text target. The standalone browser CLI still reports invalid text targets as failures.
-
-连续两次点击同一位置或执行相同滚动，且 URL、画面和文档滚动位置均未变化时，引擎会拦截下一次重复动作并请求模型重新决策。模型仍然重复时，运行以 `stalled` 结束，日志保留未派发的决策。
-
-After two unchanged clicks at the same point or two unchanged identical scrolls, the engine intercepts a further repeat and asks the model to choose a different action. A second repeated proposal ends the run as `stalled`. The log preserves the undispatched decisions.
-
-在同一展开控件上来回点击时，引擎也会结合画面回到先前状态的信号与展开状态，提示 Agent 阅读已展开的内容。控件提示可提供当前的展开或折叠状态。
-
-For repeated disclosure clicks, the engine also uses a return to the earlier screenshot and the disclosure state to ask the agent to read the open content. Control hints can include the current expanded or collapsed state.
-
-Agent 支持 Tab、Shift+Tab、Escape、上下方向键和受限的 Enter。Enter 只用于已聚焦的同源 GET 搜索表单。用 `--control-hints` 可在截图之外提供可见控件的标签与坐标。该模式会将这些标签写入观测日志，并随当前截图提供给选定的模型。
-
-The agent supports Tab, Shift+Tab, Escape, the up and down arrow keys, and limited Enter. Enter requires a focused search input in a same-origin GET form. Use `--control-hints` to include visible control labels and coordinates alongside the screenshot. This mode records those labels in the observation log and sends them to the selected model with the screenshot.
-
-`--text-hints` 可以附带视口内完整显示的短文本块，帮助模型读取数值和说明。开启后文本会写入观测日志，并发送给选定的模型。Agent 可以用独立的 `answer` 字段报告所读取的内容，日志继续保留停止理由。
-
-`--text-hints` can include short text blocks that are fully in the viewport to help the model read values and instructions. When enabled, this text is recorded in observations and sent to the selected model. The agent can return a separate `answer` with the facts it found, while the log retains its reason for stopping.
-
-`find` 可以在当前页查找字面短语，并把第一个已显示的匹配滚动到视口。找到链接后，Agent 可根据新截图决定是否点击。折叠区域仍需由 Agent 主动展开。
-
-`find` searches the current page for a literal phrase and scrolls the first displayed match into the viewport. The resulting screenshot lets the agent decide whether to follow a matching link. Collapsed content still requires the agent to open it.
-
-开启控件提示后，如果任务明确要求打开一个带引号的名称或函数名，且起始页只有一个匹配的同源链接位于视口外，引擎可先定位该链接，再由模型决定是否跟随。定位计入动作预算并写入日志。
-
-With control hints enabled, when a task asks to open a quoted name or function name and the start page has a single matching same-origin link below or above the viewport, the engine can locate it first. The model decides whether to follow it. The find action consumes one step and is logged.
+The agent entry point disables DOM control and text hints, automatic link location, and programmatic find and back. Capture covers the page viewport. The address bar, native browser find, and native back are outside the current input surface. Text input currently supports up to 1000 printable ASCII characters through virtual key presses. The standalone browser runner retains its scripting tools. Recording, diagnostics, and benchmark verification can retain internal evidence while model input remains scoped to screenshots.
 
 ### Explorer 实测基准 / Explorer live benchmark
 
@@ -223,8 +199,19 @@ With control hints enabled, when a task asks to open a quoted name or function n
 Start the local vision model and run the following from the repository root. The tool starts an isolated Waymark server and tests Waymark, the Python 3.12 docs, and public IANA pages. Each run checks the final page, the expected content in the viewport, and the model answer. Results, screenshots, browser logs, and traces are saved in a new `runs/benchmark-*` directory.
 
 ```sh
-uv run --locked python -m tools.explorer_benchmark --repeats 2 --control-hints --text-hints
+uv run --locked python -m tools.explorer_benchmark --repeats 2
 ```
+
+### 虚拟鼠标与键盘 / Virtual mouse and keyboard
+
+Agent 和浏览器脚本共用同一套虚拟输入设备。模型仍选择点击、悬停、滚动、按键或输入文字。虚拟鼠标维护当前坐标，虚拟键盘负责组合键和文字输入。
+
+The agent and scripted browser share the same virtual input devices. The model still chooses a click, hover, scroll, key press, or text action. The virtual mouse tracks its current coordinates, and the virtual keyboard handles key chords and text entry.
+
+- Agent 在点击、悬停和聚焦输入框之前，通过带时间间隔的中间位置移动到目标。独立浏览器脚本可通过 `--pointer-mode direct`（默认）或 `--pointer-mode continuous` 选择移动方式。
+- The agent traverses timed intermediate positions before clicking, hovering, or focusing a text field. The standalone browser runner offers `--pointer-mode direct` (default) and `--pointer-mode continuous`.
+- 独立浏览器脚本支持 `--text-input insert`（默认）与 `--text-input sequential`。Agent 固定使用逐键输入。
+- The standalone browser runner supports `--text-input insert` (default) and `--text-input sequential`. The agent always uses individual key presses.
 
 ### 实跑视频与输入录制 / Live video and input recording
 

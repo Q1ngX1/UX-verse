@@ -44,8 +44,8 @@ class ModelIntegrationTest(unittest.IsolatedAsyncioTestCase):
                 "openrouter", client, api_key="test-key", response_schema=FlatDecision.model_json_schema(),
             )
             adapter = DecisionAdapter(provider, "google/gemini-2.5-flash-lite", flat_output=True)
-            observation = Observation("http://localhost/", "Waymark", b"PNG", 1280, 720)
-            history = (HistoryEntry(Click(x=1279, y=719), observation.url, observation.title),)
+            observation = Observation(b"PNG", 1280, 720)
+            history = (HistoryEntry(Click(x=1279, y=719), visual_change=True),)
             request = DecisionRequest("Open Routes.", None, observation, history, 6)
             reply = await adapter.decide(request)
         decision = DECISION.validate_json(reply.decision_json)

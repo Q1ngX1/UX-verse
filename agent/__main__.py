@@ -44,13 +44,12 @@ def main(argv: list[str] | None = None, *, api_key: str | None = None) -> int:
     parser.add_argument("--max-steps", type=int, default=6, help="Maximum actions after initial navigation")
     parser.add_argument("--max-output-tokens", type=int, default=256, help="Output tokens per model call")
     parser.add_argument("--structured-output", action="store_true", help="Require a model that supports JSON Schema")
-    parser.add_argument("--control-hints", action="store_true", help="Include labels and coordinates of visible controls")
-    parser.add_argument("--text-hints", action="store_true", help="Include short, fully onscreen page text blocks")
     parser.add_argument("--model-timeout", type=float, default=20, help="Seconds per model call")
     parser.add_argument("--run-timeout", type=float, default=RUN_TIMEOUT, help="Seconds for an entire Explorer run")
     parser.add_argument("--output", type=Path, help="New directory for session evidence")
     parser.add_argument("--headed", action="store_true", help="Show the Chromium window")
     parser.add_argument("--record-input", action="store_true", help="Record live page video, pointer and keyboard input")
+    parser.add_argument("--pointer-mode", choices=("continuous",), default="continuous")
     args = parser.parse_args(argv)
     if not args.model or not args.model.strip():
         parser.error("Provide --model or set UX_VERSE_DECISION_MODEL.")
@@ -61,9 +60,9 @@ def main(argv: list[str] | None = None, *, api_key: str | None = None) -> int:
         config = AgentConfig(
             target=args.url, task=args.task, persona=args.persona,
             max_steps=args.max_steps, timeout_seconds=args.run_timeout,
-            model_timeout_seconds=args.model_timeout, control_hints=args.control_hints,
-            text_hints=args.text_hints,
+            model_timeout_seconds=args.model_timeout,
             record_input=args.record_input,
+            pointer_mode=args.pointer_mode,
         )
         result = asyncio.run(_run(args, config, output, api_key))
     except (BrowserError, OSError, ValueError) as error:

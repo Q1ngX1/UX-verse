@@ -1,5 +1,4 @@
 import asyncio
-import re
 from collections.abc import Awaitable, Callable
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
@@ -9,7 +8,7 @@ from uuid import uuid4
 from playwright.async_api import Error as BrowserError, Page
 from pydantic import BaseModel, ConfigDict, Field, HttpUrl, ValidationError
 
-from browser.actions import MAX_STEPS, Click, FindText, Navigate, PointerAction, Scroll, TypeText
+from browser.actions import MAX_STEPS, Click, Navigate, PointerAction, Scroll, TypeText
 from browser.worker import RUN_TIMEOUT, VIEWPORT, BrowserWorker, PageObservation, browser_worker
 from logs import EventSink, RunEvents
 
@@ -40,9 +39,8 @@ class AgentConfig(BaseModel):
     max_steps: int = Field(default=12, ge=1, lt=MAX_STEPS, strict=True)
     timeout_seconds: float = Field(default=RUN_TIMEOUT, gt=0, le=MAX_RUN_TIMEOUT)
     model_timeout_seconds: float = Field(default=MODEL_TIMEOUT, gt=0, le=MAX_RUN_TIMEOUT)
-    control_hints: bool = False
-    text_hints: bool = False
     record_input: bool = False
+    pointer_mode: Literal["continuous"] = "continuous"
 
 
 Status = Literal["completed", "gave_up", "stalled", "step_limit", "model_error", "browser_error", "timeout"]
@@ -65,40 +63,21 @@ def _repetition_feedback(decision: Decision, request: DecisionRequest) -> str | 
     if not isinstance(decision, Act) or len(request.history) < 2 or request.steps_remaining == 0:
         return None
     previous, latest = request.history[-2:]
-    first, second = previous.effect, latest.effect
-    if (first is None or second is None or first.get("rejected") or second.get("rejected")
-            or first["url_changed"] or second["url_changed"]
-            or first["document_scroll_changed"] or second["document_scroll_changed"]):
-        return None
     action = decision.action
-    unchanged = not (first["visual_change"] or second["visual_change"])
+    unchanged = not (previous.visual_change or latest.visual_change)
     if (isinstance(action, TypeText) and action == previous.action == latest.action
-            and not second["visual_change"]):
-        return ("The last identical text entry did not change the page. If the search needs submission, use "
-                "the Search button or Enter. For a heading already on the loaded page, try find.")
+            and not latest.visual_change):
+        return "The screenshot did not change after repeating the text entry. Reassess the visible controls."
     if isinstance(action, Click) and isinstance(previous.action, Click) and isinstance(latest.action, Click):
         if all(abs(item.x - action.x) <= 12 and abs(item.y - action.y) <= 12
                for item in (previous.action, latest.action)):
-            if second.get("visual_cycle") and second.get("clicked_disclosure_open") is True:
-                return "The disclosure is open. Read the answer below it or scroll to see its contents."
-            if second.get("visual_cycle") and second.get("clicked_disclosure_open") is not False:
-                return "Two clicks toggled the view back and forth. Try a different visible control or scroll to read the result."
+            if latest.visual_cycle:
+                return "Two clicks returned to an earlier screenshot. Inspect the current view before repeating."
             if unchanged:
                 return "Two clicks at this point had no visible effect. Choose another control, type into a search field, or scroll to find the right link."
     if unchanged and isinstance(action, Scroll) and action == previous.action == latest.action:
-        return ("The last two identical scrolls did not move the page. Try find or change direction: "
+        return ("The last two identical scrolls left the screenshot unchanged. Try a different control or direction: "
                 "use positive dy to reveal content farther down, negative dy to return toward the top.")
-    return None
-
-
-def _requested_link_name(task: str) -> str | None:
-    if not re.search(r"\b(?:open|navigate to|go to|find|locate)\b", task, re.IGNORECASE):
-        return None
-    names = re.findall(r"""(?<!\w)['"“]([^'"”]{3,100})['"”](?!\w)""", task)
-    if not names:
-        names = re.findall(r"\b[\w.]+\(\)", task)
-    if len(names) == 1:
-        return names[0]
     return None
 
 
@@ -123,7 +102,9 @@ class _Run:
                 "decision_id": decision_id,
                 "observation_id": page["observation_id"],
             }
-            self.record("model_requested", **fields, observation=page)
+            self.record("model_requested", **fields, observation={
+                "observation_id": page["observation_id"], "screenshot": page["screenshot"],
+            })
             try:
                 async with asyncio.timeout(self.config.model_timeout_seconds):
                     reply = await self.model.decide(request)
@@ -181,28 +162,14 @@ class _Run:
 
     def observe(self, page: PageObservation) -> Observation:
         return Observation(
-            url=page["url"],
-            title=page["title"],
             screenshot_png=(self.output / page["screenshot"]).read_bytes(),
             width=VIEWPORT["width"],
             height=VIEWPORT["height"],
-            controls=tuple(page.get("controls", ())),
-            visible_text=tuple(page.get("visible_text", ())),
         )
 
     async def explore(self, worker: BrowserWorker) -> tuple[Status, str, str | None]:
         page = await worker.execute(Navigate(url=self.config.target))
         history: list[HistoryEntry] = []
-        if self.config.control_hints:
-            name = _requested_link_name(self.config.task)
-            if name and await worker.has_offscreen_named_link(name):
-                action = FindText(text=name, links_only=True)
-                action_id = uuid4().hex
-                self.record("named_link_located", action_id=action_id, observation_id=page["observation_id"],
-                            name=name, action=action.model_dump(mode="json"))
-                self.steps += 1
-                page = await worker.execute(action, action_id=action_id, recover_rejection=True)
-                history.append(HistoryEntry(action, page["url"], page["title"], page.get("effect")))
         while True:
             remaining = self.config.max_steps - self.steps
             request = DecisionRequest(
@@ -222,7 +189,12 @@ class _Run:
             page = await worker.execute(
                 decision.action, action_id=action_id, decision_id=decision_id, recover_rejection=True,
             )
-            history.append(HistoryEntry(decision.action, page["url"], page["title"], page.get("effect")))
+            effect = page.get("effect")
+            history.append(HistoryEntry(
+                decision.action,
+                visual_change=effect is not None and effect["visual_change"],
+                visual_cycle=effect is not None and effect.get("visual_cycle", False),
+            ))
 
 
 async def run_agent(
@@ -232,9 +204,9 @@ async def run_agent(
     """Run one Explorer in its own browser session and write the decision and browser logs."""
     events = RunEvents()
     async with browser_worker(
-        config.target, output, headed=headed, events=events, control_hints=config.control_hints,
-        inspect_final=inspect_final, timeout_seconds=config.timeout_seconds, text_hints=config.text_hints,
-        record_input=config.record_input,
+        config.target, output, headed=headed, events=events, inspect_final=inspect_final,
+        timeout_seconds=config.timeout_seconds, record_input=config.record_input,
+        pointer_mode=config.pointer_mode, human_input=True,
     ) as worker:
         with events.open_log(output / "agent.jsonl", source="agent") as emit:
             run = _Run(config, model, output, emit)

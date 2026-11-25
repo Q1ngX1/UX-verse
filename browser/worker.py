@@ -15,7 +15,8 @@ from pydantic import HttpUrl
 
 from logs import EventSink, RunEvents
 
-from .actions import MAX_STEPS, Action, Back, Click, FindText, Hover, Navigate, PressKey, Scroll, TypeText, Wait
+from .actions import MAX_STEPS, Action, Back, Click, FindText, Hover, KeyText, Navigate, PressKey, Scroll, TypeText, Wait
+from .input_devices import PointerMode, TextInputMode, VirtualKeyboard, VirtualMouse, smooth_trajectory
 from .recording import HIDE_RECORDING_POINTER, InputRecording
 
 VIEWPORT = {"width": 1280, "height": 720}
@@ -27,8 +28,8 @@ CLICK_NAVIGATION_TIMEOUT_MS = 250
 class ActionEffect(TypedDict):
     visual_change: bool
     url_changed: bool
-    document_scroll_changed: bool
-    editable_focused: bool
+    document_scroll_changed: NotRequired[bool]
+    editable_focused: NotRequired[bool]
     document_scroll_y: NotRequired[int]
     visual_cycle: NotRequired[bool]
     clicked_disclosure_open: NotRequired[bool]
@@ -132,6 +133,8 @@ class BrowserWorker:
     def __init__(
         self, page: Page, target: HttpUrl, output: Path, emit: EventSink, *, control_hints: bool = False,
         timeout_seconds: float = RUN_TIMEOUT, text_hints: bool = False, recording: InputRecording | None = None,
+        pointer_mode: PointerMode = "direct", text_input: TextInputMode = "insert",
+        human_input: bool = False,
     ) -> None:
         self._page = page
         self._origin = origin(str(target))
@@ -140,6 +143,7 @@ class BrowserWorker:
         self._control_hints = control_hints
         self._text_hints = text_hints
         self._recording = recording
+        self._human_input = human_input
         self._step = 0
         self._lock = asyncio.Lock()
         self._deadline = monotonic() + timeout_seconds
@@ -147,6 +151,9 @@ class BrowserWorker:
         self._last_visual_hash: bytes | None = None
         self._previous_visual_hash: bytes | None = None
         self._active_action: dict[str, str] = {}
+        self._mouse = VirtualMouse(page.mouse, self._dispatch_input,
+                                   smooth_trajectory if pointer_mode == "continuous" else None)
+        self._keyboard = VirtualKeyboard(page.keyboard, self._dispatch_input, text_input)
 
     def _record(self, event: str, **fields: object) -> None:
         self._emit(event, **self._active_action, **fields)
@@ -213,18 +220,19 @@ class BrowserWorker:
             "observation_id": uuid4().hex, "url": url, "title": title, "screenshot": screenshot,
         }
         digest = sha256(image).digest()
-        if self._last_visual_hash is not None and before_scroll is not None:
-            scroll = await page.evaluate("() => [scrollX, scrollY]")
+        if self._last_visual_hash is not None:
             observation["effect"] = {
                 "visual_change": digest != self._last_visual_hash,
                 "url_changed": url != before_url,
-                "document_scroll_changed": scroll != before_scroll,
-                "document_scroll_y": round(scroll[1]),
-                "editable_focused": await page.evaluate(_IS_EDITABLE),
             }
+            if before_scroll is not None:
+                scroll = await page.evaluate("() => [scrollX, scrollY]")
+                observation["effect"]["document_scroll_changed"] = scroll != before_scroll
+                observation["effect"]["document_scroll_y"] = round(scroll[1])
+                observation["effect"]["editable_focused"] = await page.evaluate(_IS_EDITABLE)
             if digest == self._previous_visual_hash and digest != self._last_visual_hash:
                 observation["effect"]["visual_cycle"] = True
-            if isinstance(action, Click) and url == before_url:
+            if not self._human_input and isinstance(action, Click) and url == before_url:
                 disclosure = await page.evaluate("""({x, y}) => {
                     const control = document.elementFromPoint(x, y)?.closest('summary, [aria-expanded]');
                     const expanded = control?.getAttribute('aria-expanded');
@@ -250,6 +258,9 @@ class BrowserWorker:
 
     async def _perform(self, action: Action) -> None:
         page = self._page
+        if self._human_input and (isinstance(action, (Back, FindText))
+                                  or isinstance(action, TypeText) and not isinstance(action, KeyText)):
+            raise ValueError("This action is unavailable to the human-input runner.")
         if isinstance(action, (Click, Hover, TypeText)) and (action.x >= VIEWPORT["width"] or action.y >= VIEWPORT["height"]):
             raise ValueError("Pointer coordinates are outside the viewport.")
         match action:
@@ -260,27 +271,34 @@ class BrowserWorker:
             case Click(x=x, y=y) | Hover(x=x, y=y):
                 if isinstance(action, Click):
                     before_url = page.url
-                    await self._dispatch_input("mouse.click", page.mouse.click, x, y)
+                    await self._mouse.click(x, y)
                     await self._wait_for_navigation(before_url)
                 else:
-                    await self._dispatch_input("mouse.move", page.mouse.move, x, y)
+                    await self._mouse.move(x, y)
             case Scroll(dx=dx, dy=dy):
-                await self._dispatch_input("mouse.wheel", page.mouse.wheel, dx, dy)
+                await self._mouse.wheel(dx, dy)
                 await page.evaluate("""() => new Promise(resolve => {
                     requestAnimationFrame(() => requestAnimationFrame(() => resolve()));
                 })""")
             case Back():
                 await page.go_back(wait_until="domcontentloaded")
+            case KeyText(x=x, y=y, text=text) if self._human_input:
+                await self._mouse.click(x, y)
+                await self._keyboard.press("ControlOrMeta+A")
+                await self._keyboard.type_keys(text)
             case TypeText(x=x, y=y, text=text):
                 if not await page.evaluate(_IS_EDITABLE, {"x": x, "y": y}):
                     raise ActionRejected("Text entry requires an editable field at the supplied coordinates.")
-                await self._dispatch_input("mouse.click", page.mouse.click, x, y)
+                await self._mouse.prepare_click(x, y)
+                if not await page.evaluate(_IS_EDITABLE, {"x": x, "y": y}):
+                    raise ActionRejected("The editable target moved before the click. Recheck the visible field.")
+                await self._mouse.click(x, y)
                 if not await page.evaluate(_IS_EDITABLE):
                     raise ActionRejected("The editable target did not receive focus. Recheck the visible field.")
-                await self._dispatch_input("keyboard.press", page.keyboard.press, "ControlOrMeta+A")
-                await self._dispatch_input("keyboard.insert_text", page.keyboard.insert_text, text)
+                await self._keyboard.press("ControlOrMeta+A")
+                await self._keyboard.enter_text(text)
             case PressKey(key=key):
-                if key == "Enter":
+                if key == "Enter" and not self._human_input:
                     allowed = await page.evaluate("""() => {
                         const field = document.activeElement;
                         const form = field?.form;
@@ -290,7 +308,7 @@ class BrowserWorker:
                     if not allowed:
                         raise ActionRejected("Enter requires focus in a search input in a same-origin GET form.")
                 before_url = page.url
-                await self._dispatch_input("keyboard.press", page.keyboard.press, key)
+                await self._keyboard.press(key)
                 if key == "Enter":
                     await self._wait_for_navigation(before_url)
             case FindText(text=text, links_only=links_only):
@@ -333,7 +351,7 @@ class BrowserWorker:
                     if not isinstance(action, Navigate) and origin(self._page.url) != self._origin:
                         raise ValueError("Navigate to the target before interacting with the page.")
                     before_scroll = None
-                    if self._last_observation_id is not None:
+                    if self._last_observation_id is not None and not self._human_input:
                         before_scroll = await self._page.evaluate("() => [scrollX, scrollY]")
                     rejection = None
                     try:
@@ -372,9 +390,13 @@ async def browser_worker(
     target: HttpUrl, output: Path, *, headed: bool = False, events: RunEvents | None = None,
     control_hints: bool = False, inspect_final: Callable[[Page], Awaitable[None]] | None = None,
     timeout_seconds: float = RUN_TIMEOUT, text_hints: bool = False, record_input: bool = False,
+    pointer_mode: PointerMode = "direct", text_input: TextInputMode = "insert",
+    human_input: bool = False,
 ) -> AsyncIterator[BrowserWorker]:
     if target.username is not None:
         raise ValueError("The target URL must not contain credentials.")
+    if human_input and (control_hints or text_hints or pointer_mode != "continuous"):
+        raise ValueError("The human-input runner requires continuous pointer motion and screenshot-only observation.")
     output.mkdir(parents=True, exist_ok=False)
     run_events = events if events is not None else RunEvents()
     input_log = run_events.open_log(output / "inputs.jsonl", source="input") if record_input else nullcontext()
@@ -395,6 +417,7 @@ async def browser_worker(
                     page, target, output, emit, control_hints=control_hints,
                     timeout_seconds=timeout_seconds, text_hints=text_hints,
                     recording=recording,
+                    pointer_mode=pointer_mode, text_input=text_input, human_input=human_input,
                 )
                 page.on("console", worker._console_message)
                 page.on("pageerror", lambda error: worker._record("page_error", url=page.url, message=str(error)))
@@ -405,7 +428,9 @@ async def browser_worker(
                 await context.route("**/*", worker._route)
                 await context.route_web_socket("**/*", worker._close_socket)
                 await context.tracing.start(screenshots=True, snapshots=True)
-                worker._record("run_started", target=str(target), viewport=VIEWPORT)
+                worker._record("run_started", target=str(target), viewport=VIEWPORT,
+                               pointer_mode=pointer_mode, text_input="keys" if human_input else text_input,
+                               human_input=human_input)
                 try:
                     yield worker
                 finally:

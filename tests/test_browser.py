@@ -99,15 +99,31 @@ class LocalSite:
 
 
 class BrowserSmokeTest(LocalSite, unittest.TestCase):
-    def run_browser(self, directory, actions):
+    def run_browser(self, directory, actions, *options):
         script = directory / "actions.json"
         script.write_text(json.dumps(actions), encoding="utf-8")
         output = directory / "run"
         process = subprocess.run(
-            [sys.executable, "-m", "browser", self.url, "--actions", str(script), "--output", str(output)],
+            [sys.executable, "-m", "browser", self.url, "--actions", str(script), "--output", str(output), *options],
             capture_output=True, text=True, timeout=30,
         )
         return process, output
+
+    def test_sequential_virtual_keyboard_preserves_mixed_text(self):
+        with tempfile.TemporaryDirectory() as directory:
+            process, output = self.run_browser(
+                Path(directory), [{"type": "navigate", "url": self.url + "search"},
+                                  {"type": "type", "x": 150, "y": 40, "text": "Ab 溪"}],
+                "--text-input", "sequential", "--record-input",
+            )
+            self.assertEqual(process.returncode, 0, process.stderr)
+            actions = [row for row in self.events(output) if row["event"] == "action"]
+            self.assertEqual(actions[-1]["observation"]["title"], "Query: Ab 溪")
+            events = self.events(output, "inputs.jsonl")
+            self.assertTrue(any(row.get("method") == "keyboard.type" and row["arguments"] == ["Ab 溪"]
+                                for row in events))
+            self.assertTrue(any(row.get("input", {}).get("type") == "keydown"
+                                and row["input"]["key"] == "b" for row in events))
 
     def test_scripted_browsing_records_evidence(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -247,6 +263,7 @@ class AgentSmokeTest(LocalSite, unittest.IsolatedAsyncioTestCase):
             output = Path(directory) / "run"
             config = AgentConfig(
                 target=self.url + "keyboard-search", task="Find Fern Creek.", max_steps=3, record_input=True,
+                pointer_mode="continuous",
             )
             result = await run_agent(config, TestModel(), output, inspect_final=inspect_final)
             self.assertEqual(result.status, "completed")
@@ -256,10 +273,16 @@ class AgentSmokeTest(LocalSite, unittest.IsolatedAsyncioTestCase):
             commands = [row for row in events if row["event"] == "input_command"]
             delivered = [row for row in events if row["event"] == "input_event"]
             self.assertEqual({row["run_id"] for row in events}, {decision[0]["run_id"]})
-            self.assertTrue(any(row["method"] == "keyboard.insert_text" and row["arguments"] == ["Fern Creek"]
+            self.assertTrue(any(row["method"] == "keyboard.press" and row["arguments"] == ["Shift+KeyF"]
                                 and row["action_id"] == decision[0]["action_id"] for row in commands))
-            self.assertTrue(any(row["input"]["type"] == "input" and row["input"]["data"] == "Fern Creek"
-                                and row.get("decision_id") == decision[0]["decision_id"] for row in delivered))
+            self.assertFalse(any(row["method"] in {"keyboard.type", "keyboard.insert_text"} for row in commands))
+            self.assertEqual("".join(row["input"]["data"] or "" for row in delivered
+                                     if row["input"]["type"] == "input"
+                                     and row.get("decision_id") == decision[0]["decision_id"]), "Fern Creek")
+            approach = [row["input"] for row in delivered if row["input"]["type"] == "pointermove"
+                        and row.get("decision_id") == decision[0]["decision_id"]]
+            self.assertGreaterEqual(len({row["x"] for row in approach}), 4)
+            self.assertEqual((approach[-1]["x"], approach[-1]["y"]), (150, 40))
             self.assertEqual(
                 {row["input"]["type"] for row in delivered if row["input"].get("key") == "ArrowDown"
                  and row.get("decision_id") == decision[1]["decision_id"]}, {"keydown", "keyup"},
@@ -275,30 +298,28 @@ class AgentSmokeTest(LocalSite, unittest.IsolatedAsyncioTestCase):
             self.assertEqual(manifest["videos"][0]["page_id"], motion[-1]["page_id"])
             self.assertGreater((output / manifest["videos"][0]["path"]).stat().st_size, 0)
 
-    async def test_named_offscreen_link_is_located_before_choosing_to_follow_it(self):
+    async def test_offscreen_link_is_neither_located_nor_dispatched_by_agent(self):
         requests = []
 
         class TestModel:
             async def decide(self, request):
                 requests.append(request)
-                if request.observation.title == "Next page":
-                    return ModelReply('{"type":"stop","outcome":"completed","reason":"Opened the named link."}')
-                link = next(control for control in request.observation.controls if control["label"] == "Offscreen link")
-                return ModelReply(json.dumps({"type": "act", "reason": "Follow the visible link.",
-                                              "action": {"type": "click", "x": link["x"], "y": link["y"]}}))
+                if request.retry_feedback:
+                    return ModelReply('{"type":"stop","outcome":"gave_up","reason":"Link is offscreen."}')
+                return ModelReply('{"type":"act","reason":"Locate it.","action":{"type":"find","text":"Offscreen link"}}')
 
         with tempfile.TemporaryDirectory() as directory:
             output = Path(directory) / "run"
-            config = AgentConfig(target=self.url + "disclosure", task='Open "Offscreen link".',
-                                 max_steps=2, control_hints=True)
+            config = AgentConfig(target=self.url + "disclosure", task='Open "Offscreen link".', max_steps=2)
             result = await run_agent(config, TestModel(), output)
-            self.assertEqual((result.status, result.steps, result.model_calls), ("completed", 2, 2))
-            self.assertEqual(requests[0].history[0].action.type, "find")
-            self.assertEqual(requests[0].observation.title, "Disclosure fixture")
-            self.assertEqual(requests[-1].observation.title, "Next page")
-            self.assertTrue(any(event["event"] == "named_link_located" for event in self.events(output, "agent.jsonl")))
+            self.assertEqual((result.status, result.steps, result.model_calls), ("gave_up", 0, 2))
+            self.assertFalse(requests[0].history)
+            self.assertTrue(requests[1].retry_feedback)
+            self.assertEqual(set(vars(requests[0].observation)), {"screenshot_png", "width", "height"})
+            self.assertEqual([row["action"]["type"] for row in self.events(output)
+                              if row["event"] == "action"], ["navigate"])
 
-    async def test_disclosure_cycle_preserves_reopen_and_intercepts_next_close(self):
+    async def test_disclosure_cycle_feedback_uses_only_screenshot_changes(self):
         calls = []
 
         class TestModel:
@@ -319,9 +340,10 @@ class AgentSmokeTest(LocalSite, unittest.IsolatedAsyncioTestCase):
                 AgentConfig(target=self.url + "disclosure", task="Read the answer.", max_steps=4),
                 TestModel(), Path(directory) / "run",
             )
-            self.assertEqual((result.status, result.steps, result.model_calls), ("completed", 4, 6))
-            self.assertTrue(calls[3].history[-1].effect["visual_cycle"])
-            self.assertIn("disclosure is open", calls[4].retry_feedback)
+            self.assertEqual(result.status, "completed")
+            retry = next(call for call in calls if call.retry_feedback)
+            self.assertTrue(retry.history[-1].visual_cycle)
+            self.assertIn("returned to an earlier screenshot", retry.retry_feedback)
 
     async def test_repeated_no_effect_click_gets_a_retry_without_dispatch(self):
         calls = []
@@ -329,7 +351,7 @@ class AgentSmokeTest(LocalSite, unittest.IsolatedAsyncioTestCase):
         class TestModel:
             async def decide(self, request):
                 calls.append(request)
-                if request.observation.title == "Next page":
+                if request.history and request.history[-1].action == Click(x=20, y=20):
                     decision = {"type": "stop", "outcome": "completed", "reason": "Reached the next page."}
                 else:
                     point = {"x": 20, "y": 20} if request.retry_feedback else {"x": 400, "y": 400}
@@ -346,10 +368,10 @@ class AgentSmokeTest(LocalSite, unittest.IsolatedAsyncioTestCase):
             self.assertEqual(len(rejected), 1)
             self.assertNotIn("action_id", rejected[0])
 
-    async def test_invalid_text_target_is_observed_and_agent_can_recover(self):
+    async def test_non_ascii_text_is_rejected_before_any_input(self):
         requests: list[DecisionRequest] = []
         decisions = iter([
-            {"type": "act", "action": {"type": "type", "x": 400, "y": 400, "text": "answer"}},
+            {"type": "act", "action": {"type": "type", "x": 400, "y": 400, "text": "溪"}},
             {"type": "act", "action": {"type": "type", "x": 150, "y": 40, "text": "answer"}},
             {"type": "stop", "outcome": "completed"},
         ])
@@ -364,15 +386,12 @@ class AgentSmokeTest(LocalSite, unittest.IsolatedAsyncioTestCase):
             result = await run_agent(
                 AgentConfig(target=self.url + "search", task="Search", max_steps=2), TestModel(), output,
             )
-            self.assertEqual((result.status, result.steps), ("completed", 2))
-            effect = requests[1].history[-1].effect
-            self.assertIn("editable field", effect["rejected"])
-            self.assertEqual(requests[1].observation.title, "Search fixture")
-            self.assertTrue(requests[2].history[-1].effect["editable_focused"])
-            self.assertEqual(requests[2].observation.title, "Query: answer")
+            self.assertEqual((result.status, result.steps), ("completed", 1))
+            self.assertTrue(requests[1].retry_feedback)
+            self.assertFalse(requests[1].history)
             actions = [event for event in self.events(output) if event["event"] == "action"]
-            self.assertEqual(actions[1]["status"], "rejected")
-            self.assertEqual(actions[1]["observation"]["effect"], effect)
+            self.assertEqual(len(actions), 2)
+            self.assertEqual(actions[1]["observation"]["title"], "Query: answer")
 
     async def test_agent_explores_through_configured_provider(self):
         calls = []
@@ -385,7 +404,9 @@ class AgentSmokeTest(LocalSite, unittest.IsolatedAsyncioTestCase):
             self.assertTrue(content[1]["image_url"].startswith("data:image/png;base64,iVBOR"))
             observation = json.loads(content[0]["text"])
             calls.append(observation)
-            if observation["page"]["title"] == "Start page":
+            self.assertEqual(set(observation), {"task", "persona", "steps_remaining", "history",
+                                                "retry_feedback", "viewport"})
+            if not observation["history"]:
                 decision = {"type": "act", "reason": "Open the link.", "action": {"type": "click", "x": 20, "y": 20}}
             else:
                 decision = {"type": "stop", "reason": "The next page opened.", "outcome": "completed"}
@@ -402,7 +423,7 @@ class AgentSmokeTest(LocalSite, unittest.IsolatedAsyncioTestCase):
                 model = DecisionAdapter(ResponsesProvider("openai", client, api_key="test-key"), "decision-model")
                 result = await run_agent(config, model, output)
             self.assertEqual((result.status, result.steps, result.model_calls), ("completed", 1, 2))
-            self.assertEqual(calls[-1]["history"][0]["url"], self.url + "next")
+            self.assertEqual(set(calls[-1]["history"][0]), {"action", "visual_change", "visual_cycle"})
             agent_events = self.events(output, "agent.jsonl")
             browser_events = self.events(output)
             timeline = sorted(agent_events + browser_events, key=lambda event: event["seq"])
@@ -430,7 +451,7 @@ class AgentSmokeTest(LocalSite, unittest.IsolatedAsyncioTestCase):
         class TestModel:
             async def decide(self, request):
                 requests.append(request)
-                if request.observation.title == "Next page":
+                if request.history:
                     response = {"type": "stop", "outcome": "completed", "reason": "Reached the next page.",
                                 "answer": "Next page"}
                 else:
@@ -441,7 +462,6 @@ class AgentSmokeTest(LocalSite, unittest.IsolatedAsyncioTestCase):
             output = Path(directory) / "run"
             config = AgentConfig(
                 target=self.url, task="Open the next page.", persona="First-time visitor", max_steps=1,
-                control_hints=True, text_hints=True,
             )
             inspected = []
 
@@ -457,11 +477,8 @@ class AgentSmokeTest(LocalSite, unittest.IsolatedAsyncioTestCase):
             self.assertEqual((first.task, first.persona), (config.task, config.persona))
             self.assertEqual((first.steps_remaining, last.steps_remaining), (1, 0))
             self.assertFalse(first.history)
-            self.assertEqual(first.observation.controls[0]["label"], "Next")
-            self.assertFalse(last.observation.controls)
-            self.assertIn("Next page", last.observation.visible_text)
             self.assertEqual(last.history[0].action, Click(x=20, y=20))
-            self.assertEqual(last.history[0].url, self.url + "next")
+            self.assertTrue(last.history[0].visual_change)
             self.assertEqual((first.observation.width, first.observation.height), (1280, 720))
             self.assertEqual(first.observation.screenshot_png, (output / "screenshots" / "001.png").read_bytes())
             self.assertNotEqual(first.observation.screenshot_png, last.observation.screenshot_png)

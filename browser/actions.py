@@ -36,6 +36,12 @@ class TypeText(PointerAction):
     text: Annotated[str, Field(min_length=1, max_length=1000)]
 
 
+class KeyText(TypeText):
+    """Printable ASCII that Chromium can enter with keyboard events."""
+
+    text: Annotated[str, Field(min_length=1, max_length=1000, pattern=r"^[ -~]+$")]
+
+
 class Back(BrowserAction):
     type: Literal["back"] = "back"
 

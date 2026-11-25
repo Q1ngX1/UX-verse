@@ -3,12 +3,11 @@ from typing import Annotated, Literal, Protocol
 
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter
 
-from browser.actions import Back, Click, FindText, Hover, PressKey, Scroll, TypeText, Wait
-from browser.worker import ActionEffect, ControlHint
+from browser.actions import Click, Hover, KeyText, PressKey, Scroll, Wait
 from models.contracts import ModelError as ModelError, ModelUsage as ModelUsage, RetryableModelError as RetryableModelError
 
 ExplorerAction = Annotated[
-    Click | Hover | Scroll | TypeText | Back | PressKey | FindText | Wait, Field(discriminator="type"),
+    Click | Hover | Scroll | KeyText | PressKey | Wait, Field(discriminator="type"),
 ]
 
 
@@ -35,21 +34,16 @@ DECISION = TypeAdapter(Decision)
 
 @dataclass(frozen=True)
 class Observation:
-    url: str
-    title: str
     screenshot_png: bytes
     width: int
     height: int
-    controls: tuple[ControlHint, ...] = ()
-    visible_text: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
 class HistoryEntry:
     action: ExplorerAction
-    url: str
-    title: str
-    effect: ActionEffect | None = None
+    visual_change: bool
+    visual_cycle: bool = False
 
 
 @dataclass(frozen=True)

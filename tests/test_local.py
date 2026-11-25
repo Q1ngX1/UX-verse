@@ -18,7 +18,7 @@ class LocalProviderTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(decision.action.model_dump(), {"type": "scroll", "dx": 0, "dy": expected})
 
     async def test_text_decision_preserves_literal_query_and_normalizes_target(self):
-        query = 'Fern Creek Loop "溪流"'
+        query = 'Fern Creek Loop "north"'
         value = {"operation":"type", "reason":"Search the directory.", "x":500, "y":500,
                  "dx":0, "dy":0, "ms":0, "text":query}
         def handle(request):
@@ -29,7 +29,7 @@ class LocalProviderTest(unittest.IsolatedAsyncioTestCase):
             return httpx.Response(200, json={"choices":[{"finish_reason":"stop", "message":{"content":json.dumps(value)}}]})
         async with httpx.AsyncClient(transport=httpx.MockTransport(handle)) as client:
             adapter = DecisionAdapter(LocalProvider(client, response_schema=FlatDecision.model_json_schema()), "local", flat_output=True)
-            reply = await adapter.decide(DecisionRequest("Search for a route.", None, Observation("http://localhost/", "Routes", b"PNG",1280,720), (), 4))
+            reply = await adapter.decide(DecisionRequest("Search for a route.", None, Observation(b"PNG",1280,720), (), 4))
         self.assertEqual(DECISION.validate_json(reply.decision_json).action.model_dump(), {
             "type":"type", "text":query, "x":640, "y":360,
         })
@@ -56,7 +56,7 @@ class LocalProviderTest(unittest.IsolatedAsyncioTestCase):
             provider = LocalProvider(client, response_schema=FlatDecision.model_json_schema())
             adapter = DecisionAdapter(provider, "qwen3-vl-8b-local", flat_output=True)
             reply = await adapter.decide(DecisionRequest(
-                "Open the route directory.", None, Observation("http://localhost/", "Waymark", b"PNG", 1280, 720), (), 6,
+                "Open the route directory.", None, Observation(b"PNG", 1280, 720), (), 6,
             ))
         self.assertEqual(DECISION.validate_json(reply.decision_json).action.model_dump(), {"type": "click", "x": 640, "y": 360})
         self.assertEqual(reply.usage, ModelUsage(1400, 60))

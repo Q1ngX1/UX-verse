@@ -134,8 +134,8 @@ async def run(args: argparse.Namespace, mock_url: str, output: Path) -> None:
                 try:
                     result = await run_agent(
                         AgentConfig(target=target, task=case.task, max_steps=args.steps, model_timeout_seconds=45,
-                                    timeout_seconds=args.run_timeout, control_hints=args.control_hints,
-                                    text_hints=args.text_hints, record_input=args.record_input),
+                                    timeout_seconds=args.run_timeout, record_input=args.record_input,
+                                    pointer_mode=args.pointer_mode),
                         model, run_dir, inspect_final=inspect_final,
                     )
                     answer = result.answer or result.reason
@@ -155,8 +155,8 @@ async def run(args: argparse.Namespace, mock_url: str, output: Path) -> None:
                 print(json.dumps(row, ensure_ascii=False), flush=True)
                 (output / "report.json").write_text(json.dumps(
                     {"model": args.model, "steps": args.steps, "run_timeout": args.run_timeout,
-                     "control_hints": args.control_hints, "text_hints": args.text_hints,
-                     "record_input": args.record_input, "runs": records},
+                     "record_input": args.record_input, "pointer_mode": args.pointer_mode,
+                     "observation": "screenshot", "text_input": "keys", "runs": records},
                     ensure_ascii=False, indent=2,
                 ), encoding="utf-8")
 
@@ -168,9 +168,8 @@ def main() -> None:
     parser.add_argument("--repeats", type=int, default=2)
     parser.add_argument("--steps", type=int, default=10)
     parser.add_argument("--run-timeout", type=float, default=180)
-    parser.add_argument("--control-hints", action="store_true")
-    parser.add_argument("--text-hints", action="store_true")
     parser.add_argument("--record-input", action="store_true", help="Record live browser video and input events")
+    parser.add_argument("--pointer-mode", choices=("continuous",), default="continuous")
     parser.add_argument("--model", default="qwen3-vl-8b-local")
     parser.add_argument("--base-url", default="http://127.0.0.1:8081/v1")
     args = parser.parse_args()
