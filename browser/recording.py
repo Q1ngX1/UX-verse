@@ -65,12 +65,13 @@ _INSTALL = r"""
         'pointerout', 'click', 'dblclick', 'contextmenu', 'wheel'
     ];
     const keyboard = ['keydown', 'keyup'];
+    const touch = ['touchstart', 'touchmove', 'touchend', 'touchcancel'];
     const text = ['beforeinput', 'input', 'compositionstart', 'compositionupdate', 'compositionend'];
     const position = event => ({
         x: event.clientX, y: event.clientY, screen_x: event.screenX, screen_y: event.screenY,
         browser_time_ms: performance.timeOrigin + event.timeStamp
     });
-    for (const name of [...pointer, ...keyboard, ...text]) {
+    for (const name of [...pointer, ...touch, ...keyboard, ...text]) {
         window.addEventListener(name, event => {
             const target = event.composedPath()[0];
             const payload = {
@@ -101,6 +102,23 @@ _INSTALL = r"""
                     pointerUpdated = true;
                     if (marker) marker.style.display = 'none';
                     payload.pointer_visible = false;
+                }
+            } else if (touch.includes(name)) {
+                const contact = event.changedTouches[0];
+                if (contact) {
+                    Object.assign(payload, {x: contact.clientX, y: contact.clientY,
+                        screen_x: contact.screenX, screen_y: contact.screenY,
+                        pointer_type: 'touch', touch_id: contact.identifier});
+                    if (event.isTrusted) {
+                        pointerUpdated = true;
+                        if (name === 'touchstart' || name === 'touchmove') {
+                            showPointer(contact.clientX, contact.clientY, name === 'touchstart');
+                            payload.pointer_visible = true;
+                        } else {
+                            if (marker) marker.style.display = 'none';
+                            payload.pointer_visible = false;
+                        }
+                    }
                 }
             } else if (keyboard.includes(name)) {
                 Object.assign(payload, {

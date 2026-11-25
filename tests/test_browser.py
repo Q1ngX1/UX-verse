@@ -43,6 +43,19 @@ class TestSite(BaseHTTPRequestHandler):
                 <form action="/next" method="get"><input type="search" name="q"></form>'''
         elif self.path == "/next?q=Fern+Creek":
             body = "<!doctype html><title>Keyboard results</title><h1>Fern Creek</h1>"
+        elif self.path == "/touch":
+            body = """<!doctype html><meta name="viewport" content="width=device-width, initial-scale=1">
+                <title>Touch fixture</title>
+                <style>body{margin:0;min-height:1800px}
+                input,button{display:block;width:180px;height:48px}</style>
+                <input aria-label="Query"><button>Confirm</button>
+                <script>
+                  const button = document.querySelector('button');
+                  button.addEventListener('touchstart', event => button.dataset.trusted = event.isTrusted);
+                  button.addEventListener('click', () => {
+                    document.title = button.dataset.trusted + ': ' + document.querySelector('input').value;
+                  });
+                </script>"""
         elif self.path == "/disclosure":
             body = '''<!doctype html><title>Disclosure fixture</title>
                 <style>body{margin:0;min-height:1600px} summary{height:48px}</style>
@@ -173,6 +186,21 @@ class BrowserSmokeTest(LocalSite, unittest.TestCase):
             self.assertTrue((output / "screenshots" / "001.png").is_file())
             self.assertTrue(zipfile.is_zipfile(output / "trace.zip"))
 
+    def test_scripted_viewport_controls_screenshot_size_and_pointer_bounds(self):
+        with tempfile.TemporaryDirectory() as directory:
+            process, output = self.run_browser(
+                Path(directory), [{"type": "click", "x": 390, "y": 20}], "--viewport", "390x844",
+            )
+            self.assertEqual(process.returncode, 1, process.stderr)
+            self.assertIn("outside the viewport", process.stderr)
+            events = self.events(output)
+            started = next(event for event in events if event["event"] == "run_started")
+            initial = next(event["observation"] for event in events if event["event"] == "action")
+            self.assertEqual(started["viewport"], {"width": 390, "height": 844})
+            self.assertEqual(initial["viewport"], started["viewport"])
+            image = (output / initial["screenshot"]).read_bytes()
+            self.assertEqual(struct.unpack(">II", image[16:24]), (390, 844))
+
     def test_coordinate_text_entry_replaces_value_and_does_not_submit(self):
         with tempfile.TemporaryDirectory() as directory:
             query = 'Fern Creek Loop <literal> "溪流"'
@@ -238,6 +266,46 @@ class BrowserSmokeTest(LocalSite, unittest.TestCase):
 
 
 class AgentSmokeTest(LocalSite, unittest.IsolatedAsyncioTestCase):
+    async def test_mobile_exploration_retries_mouse_action_and_uses_trusted_touch(self):
+        requests = []
+        decisions = iter([
+            {"type": "act", "action": {"type": "click", "x": 60, "y": 75}, "reason": "Wrong device action."},
+            {"type": "act", "action": {"type": "type", "x": 60, "y": 25, "text": "Trail"}, "reason": "Enter query."},
+            {"type": "act", "action": {"type": "tap", "x": 60, "y": 75}, "reason": "Confirm query."},
+            {"type": "act", "action": {"type": "swipe", "x": 190, "y": 680, "end_x": 190, "end_y": 200},
+             "reason": "Explore farther down."},
+            {"type": "stop", "outcome": "completed", "reason": "Budget reached.", "answer": "Tried the form."},
+        ])
+
+        class TestModel:
+            async def decide(self, request):
+                requests.append(request)
+                return ModelReply(json.dumps(next(decisions)))
+
+        final = {}
+
+        async def inspect_final(page):
+            final["scroll"] = await page.evaluate("scrollY")
+            final["title"] = await page.title()
+
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "run"
+            config = AgentConfig(
+                target=self.url + "touch", mode="explore", device="mobile", max_steps=3,
+                viewport={"width": 390, "height": 844}, record_input=True,
+            )
+            result = await run_agent(config, TestModel(), output, inspect_final=inspect_final)
+            self.assertEqual((result.status, result.steps, result.answer), ("completed", 3, "Tried the form."))
+            self.assertEqual((requests[0].mode, requests[0].device), ("explore", "mobile"))
+            self.assertTrue(requests[1].retry_feedback)
+            self.assertEqual(requests[-1].steps_remaining, 0)
+            self.assertEqual(final["title"], "true: Trail")
+            self.assertGreater(final["scroll"], 0)
+            events = self.events(output, "inputs.jsonl")
+            self.assertTrue(any(row.get("input", {}).get("type") == "touchmove"
+                                and row["input"]["trusted"] for row in events))
+            self.assertFalse(any(row.get("method", "").startswith("mouse.") for row in events))
+
     async def test_live_recording_correlates_model_text_keys_and_observed_motion(self):
         actions = iter([
             {"type": "act", "action": {"type": "type", "x": 150, "y": 40, "text": "Fern Creek"}},

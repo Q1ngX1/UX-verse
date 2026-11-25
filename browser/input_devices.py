@@ -5,8 +5,9 @@ from collections.abc import Awaitable, Callable, Iterable
 from math import hypot
 from typing import Literal
 
-from playwright.async_api import Keyboard, Mouse
+from playwright.async_api import CDPSession, Keyboard, Mouse, Touchscreen
 
+Device = Literal["desktop", "mobile"]
 PointerMode = Literal["direct", "continuous"]
 TextInputMode = Literal["insert", "sequential"]
 Dispatch = Callable[..., Awaitable[None]]
@@ -67,6 +68,29 @@ class VirtualMouse:
 
     async def wheel(self, dx: int, dy: int) -> None:
         await self._dispatch("mouse.wheel", self._backend.wheel, dx, dy)
+
+
+class VirtualTouchscreen:
+    def __init__(self, backend: Touchscreen, session: CDPSession, dispatch: Dispatch) -> None:
+        self._backend = backend
+        self._session = session
+        self._dispatch = dispatch
+
+    async def tap(self, x: int, y: int) -> None:
+        await self._dispatch("touchscreen.tap", self._backend.tap, x, y)
+
+    async def _touch(self, event: str, points: list[dict[str, int]]) -> None:
+        await self._dispatch("Input.dispatchTouchEvent", self._session.send, "Input.dispatchTouchEvent",
+                             {"type": event, "touchPoints": points})
+
+    async def swipe(self, start: Point, end: Point) -> None:
+        await self._touch("touchStart", [{"x": start[0], "y": start[1]}])
+        try:
+            for (x, y), delay in smooth_trajectory(start, end):
+                await asyncio.sleep(delay)
+                await self._touch("touchMove", [{"x": x, "y": y}])
+        finally:
+            await self._touch("touchEnd", [])
 
 
 class VirtualKeyboard:

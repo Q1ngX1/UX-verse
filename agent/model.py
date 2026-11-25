@@ -3,12 +3,14 @@ from typing import Annotated, Literal, Protocol
 
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter
 
-from browser.actions import Click, Hover, KeyText, PressKey, Scroll, Wait
+from browser.actions import Click, Hover, KeyText, PressKey, Scroll, Swipe, Tap, Wait
+from browser.input_devices import Device
 from models.contracts import ModelError as ModelError, ModelUsage as ModelUsage, RetryableModelError as RetryableModelError
 
-ExplorerAction = Annotated[
-    Click | Hover | Scroll | KeyText | PressKey | Wait, Field(discriminator="type"),
-]
+Mode = Literal["task", "explore"]
+DesktopAction = Annotated[Click | Hover | Scroll | KeyText | PressKey | Wait, Field(discriminator="type")]
+MobileAction = Annotated[Tap | Swipe | KeyText | Wait, Field(discriminator="type")]
+ExplorerAction = DesktopAction | MobileAction
 
 
 class DecisionBase(BaseModel):
@@ -28,8 +30,20 @@ class Stop(DecisionBase):
     answer: Annotated[str, Field(min_length=1, max_length=1000)] | None = None
 
 
+class DesktopAct(Act):
+    action: DesktopAction
+
+
+class MobileAct(Act):
+    action: MobileAction
+
+
 Decision = Annotated[Act | Stop, Field(discriminator="type")]
 DECISION = TypeAdapter(Decision)
+DEVICE_DECISIONS = {
+    "desktop": TypeAdapter(Annotated[DesktopAct | Stop, Field(discriminator="type")]),
+    "mobile": TypeAdapter(Annotated[MobileAct | Stop, Field(discriminator="type")]),
+}
 
 
 @dataclass(frozen=True)
@@ -54,6 +68,8 @@ class DecisionRequest:
     history: tuple[HistoryEntry, ...]
     steps_remaining: int
     retry_feedback: str | None = None
+    mode: Mode = "task"
+    device: Device = "desktop"
 
 
 @dataclass(frozen=True)
