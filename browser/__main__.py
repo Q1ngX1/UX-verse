@@ -2,6 +2,7 @@ import argparse
 import asyncio
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import get_args
 from uuid import uuid4
 
 from playwright.async_api import Error
@@ -31,7 +32,7 @@ def main() -> None:
     parser.add_argument("--output", type=Path, help="New directory for session evidence")
     parser.add_argument("--headed", action="store_true", help="Show the Chromium window")
     parser.add_argument("--record-input", action="store_true", help="Record live page video, pointer and keyboard input")
-    parser.add_argument("--pointer-mode", choices=("direct", "continuous"), default="direct")
+    parser.add_argument("--pointer-mode", choices=get_args(PointerMode), default="direct")
     parser.add_argument("--text-input", choices=("insert", "sequential"), default="insert")
     args = parser.parse_args()
     run_id = f"{datetime.now(UTC):%Y%m%dT%H%M%S}-{uuid4().hex[:8]}"

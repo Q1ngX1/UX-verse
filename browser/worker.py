@@ -2,6 +2,7 @@ import asyncio
 import re
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager, nullcontext
+from functools import partial
 from hashlib import sha256
 from pathlib import Path
 from time import monotonic
@@ -16,7 +17,7 @@ from pydantic import HttpUrl
 from logs import EventSink, RunEvents
 
 from .actions import MAX_STEPS, Action, Back, Click, FindText, Hover, KeyText, Navigate, PressKey, Scroll, TypeText, Wait
-from .input_devices import PointerMode, TextInputMode, VirtualKeyboard, VirtualMouse, smooth_trajectory
+from .input_devices import PointerMode, TextInputMode, VirtualKeyboard, VirtualMouse, cursory_trajectory, smooth_trajectory
 from .recording import HIDE_RECORDING_POINTER, InputRecording
 
 VIEWPORT = {"width": 1280, "height": 720}
@@ -151,8 +152,11 @@ class BrowserWorker:
         self._last_visual_hash: bytes | None = None
         self._previous_visual_hash: bytes | None = None
         self._active_action: dict[str, str] = {}
-        self._mouse = VirtualMouse(page.mouse, self._dispatch_input,
-                                   smooth_trajectory if pointer_mode == "continuous" else None)
+        trajectory = {
+            "continuous": smooth_trajectory,
+            "cursory": partial(cursory_trajectory, viewport=(VIEWPORT["width"], VIEWPORT["height"])),
+        }.get(pointer_mode)
+        self._mouse = VirtualMouse(page.mouse, self._dispatch_input, trajectory, smooth_scroll=human_input)
         self._keyboard = VirtualKeyboard(page.keyboard, self._dispatch_input, text_input)
 
     def _record(self, event: str, **fields: object) -> None:
@@ -395,7 +399,7 @@ async def browser_worker(
 ) -> AsyncIterator[BrowserWorker]:
     if target.username is not None:
         raise ValueError("The target URL must not contain credentials.")
-    if human_input and (control_hints or text_hints or pointer_mode != "continuous"):
+    if human_input and (control_hints or text_hints or pointer_mode == "direct"):
         raise ValueError("The human-input runner requires continuous pointer motion and screenshot-only observation.")
     output.mkdir(parents=True, exist_ok=False)
     run_events = events if events is not None else RunEvents()
@@ -429,7 +433,8 @@ async def browser_worker(
                 await context.route_web_socket("**/*", worker._close_socket)
                 await context.tracing.start(screenshots=True, snapshots=True)
                 worker._record("run_started", target=str(target), viewport=VIEWPORT,
-                               pointer_mode=pointer_mode, text_input="keys" if human_input else text_input,
+                               pointer_mode=pointer_mode, scroll_mode="smooth" if human_input else "direct",
+                               text_input="keys" if human_input else text_input,
                                human_input=human_input)
                 try:
                     yield worker

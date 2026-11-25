@@ -5,11 +5,13 @@ import os
 from dataclasses import asdict
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import get_args
 from uuid import uuid4
 
 import httpx
 from playwright.async_api import Error as BrowserError
 
+from browser.input_devices import ContinuousPointerMode
 from browser.worker import RUN_TIMEOUT
 from models.decision import DecisionAdapter, FlatDecision
 from models.local import LocalProvider
@@ -49,7 +51,7 @@ def main(argv: list[str] | None = None, *, api_key: str | None = None) -> int:
     parser.add_argument("--output", type=Path, help="New directory for session evidence")
     parser.add_argument("--headed", action="store_true", help="Show the Chromium window")
     parser.add_argument("--record-input", action="store_true", help="Record live page video, pointer and keyboard input")
-    parser.add_argument("--pointer-mode", choices=("continuous",), default="continuous")
+    parser.add_argument("--pointer-mode", choices=get_args(ContinuousPointerMode), default="continuous")
     args = parser.parse_args(argv)
     if not args.model or not args.model.strip():
         parser.error("Provide --model or set UX_VERSE_DECISION_MODEL.")

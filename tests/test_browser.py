@@ -10,12 +10,14 @@ import zipfile
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from time import sleep
+from unittest.mock import patch
 
 import httpx
 
 from agent.engine import AgentConfig, run_agent
 from agent.model import DECISION, DecisionRequest, ModelReply, ModelUsage, RetryableModelError
 from browser.actions import Click
+from browser.input_devices import cursory_trajectory, smooth_wheel_steps
 from models.decision import DecisionAdapter
 from models.responses import ResponsesProvider
 
@@ -48,6 +50,21 @@ class TestSite(BaseHTTPRequestHandler):
                 <style>body{margin:0;min-height:1600px} summary{height:48px}</style>
                 <details><summary>Show answer</summary><p>Answer inside.</p></details>
                 <a style="position:absolute;top:1400px" href="/next">Offscreen link</a>'''
+        elif self.path == "/scroll-box":
+            body = '''<!doctype html><title>Scroll 0,0</title>
+                <style>
+                    #box { margin: 32px; width: 360px; height: 220px; overflow: auto }
+                    #box div { width: 1600px; height: 1800px; background: linear-gradient(120deg, gold, teal) }
+                </style>
+                <div id="box"><div></div></div>
+                <script>
+                    const box = document.getElementById('box');
+                    window.scrollSamples = [];
+                    box.addEventListener('scroll', () => {
+                        window.scrollSamples.push([box.scrollLeft, box.scrollTop]);
+                        document.title = 'Scroll ' + box.scrollLeft + ',' + box.scrollTop;
+                    });
+                </script>'''
         elif self.path == "/next":
             body = '<title>Loading next page</title><h1></h1><script defer src="/next.js"></script>'
         elif self.path == "/next.js":
@@ -98,6 +115,29 @@ class LocalSite:
         return [json.loads(line) for line in (output / name).read_text(encoding="utf-8").splitlines()]
 
 
+class InputTrajectoryTest(unittest.TestCase):
+    def test_cursory_preserves_sample_timing_with_viewport_clipping(self):
+        with patch("cursory.generate_trajectory", return_value=(
+            [(0, 0), (-4.2, 90.6), (70.6, 120.2), (99, 99)], [0, 8, 25, 40],
+        )) as generate:
+            steps = list(cursory_trajectory((0, 0), (99, 99), viewport=(100, 100)))
+        generate.assert_called_once_with((0, 0), (99, 99), frequency=60)
+        self.assertEqual(steps, [((0, 91), 0.008), ((71, 99), 0.017), ((99, 99), 0.015)])
+
+    def test_smooth_wheel_preserves_both_axes_and_eases_to_a_stop(self):
+        self.assertEqual(list(smooth_wheel_steps(0, 0)), [])
+        self.assertEqual(list(smooth_wheel_steps(-1, 0)), [((-1, 0), 0)])
+        for dx, dy in ((120, -600), (-300, 250), (5000, 0)):
+            with self.subTest(dx=dx, dy=dy):
+                steps = list(smooth_wheel_steps(dx, dy))
+                offsets, pauses = zip(*steps, strict=True)
+                self.assertEqual(tuple(map(sum, zip(*offsets, strict=True))), (dx, dy))
+                self.assertTrue(all(x * dx >= 0 and y * dy >= 0 for x, y in offsets))
+                sizes = [abs(x) + abs(y) for x, y in offsets]
+                self.assertGreater(max(sizes), max(sizes[0], sizes[-1]))
+                self.assertLess(sum(pauses), 0.7)
+
+
 class BrowserSmokeTest(LocalSite, unittest.TestCase):
     def run_browser(self, directory, actions, *options):
         script = directory / "actions.json"
@@ -108,6 +148,27 @@ class BrowserSmokeTest(LocalSite, unittest.TestCase):
             capture_output=True, text=True, timeout=30,
         )
         return process, output
+
+    def test_cursory_mode_records_browser_pointer_path_before_click(self):
+        with tempfile.TemporaryDirectory() as directory:
+            process, output = self.run_browser(
+                Path(directory), [{"type": "hover", "x": 1000, "y": 500}, {"type": "click", "x": 100, "y": 40}],
+                "--pointer-mode", "cursory", "--record-input",
+            )
+            self.assertEqual(process.returncode, 0, process.stderr)
+            events = self.events(output)
+            self.assertEqual(events[0]["pointer_mode"], "cursory")
+            click = next(row for row in events if row.get("action", {}).get("type") == "click")
+            self.assertEqual(click["after_url"], self.url + "next")
+            inputs = [row["input"] for row in self.events(output, "inputs.jsonl")
+                      if row["event"] == "input_event" and row.get("action_id") == click["action_id"]]
+            moves = [event for event in inputs if event["type"] == "pointermove"]
+            down = next(event for event in inputs if event["type"] == "pointerdown")
+            self.assertGreater(len({(event["x"], event["y"]) for event in moves}), 2)
+            self.assertTrue(all(event["trusted"] and 0 <= event["x"] < 1280 and 0 <= event["y"] < 720
+                                for event in moves))
+            self.assertLess(moves[0]["browser_time_ms"], down["browser_time_ms"])
+            self.assertEqual((down["x"], down["y"]), (100, 40))
 
     def test_sequential_virtual_keyboard_preserves_mixed_text(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -238,6 +299,46 @@ class BrowserSmokeTest(LocalSite, unittest.TestCase):
 
 
 class AgentSmokeTest(LocalSite, unittest.IsolatedAsyncioTestCase):
+    async def test_agent_scroll_delivers_timed_wheel_events_to_pointer_container(self):
+        decisions = iter([
+            {"type": "act", "action": {"type": "hover", "x": 150, "y": 120}},
+            {"type": "act", "action": {"type": "scroll", "dx": 260, "dy": 430}},
+            {"type": "act", "action": {"type": "scroll", "dx": -120, "dy": -210}},
+            {"type": "stop", "outcome": "completed"},
+        ])
+
+        class TestModel:
+            async def decide(self, request):
+                return ModelReply(json.dumps({**next(decisions), "reason": "Scroll inside the box."}))
+
+        async def inspect_final(page):
+            self.assertEqual(await page.evaluate("[scrollX, scrollY]"), [0, 0])
+            samples = await page.evaluate("window.scrollSamples")
+            self.assertGreater(len({y for _, y in samples if 0 < y < 430}), 8)
+            self.assertEqual(samples[-1], [140, 220])
+
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "run"
+            config = AgentConfig(target=self.url + "scroll-box", task="Scroll within the box.", record_input=True)
+            result = await run_agent(config, TestModel(), output, inspect_final=inspect_final)
+            self.assertEqual((result.status, result.steps), ("completed", 3))
+            actions = self.events(output)
+            self.assertEqual(actions[0]["scroll_mode"], "smooth")
+            scrolls = [event for event in actions if event.get("action", {}).get("type") == "scroll"]
+            self.assertEqual([event["observation"]["title"] for event in scrolls], ["Scroll 260,430", "Scroll 140,220"])
+            inputs = self.events(output, "inputs.jsonl")
+            for scroll in scrolls:
+                associated = [event for event in inputs if event.get("action_id") == scroll["action_id"]]
+                commands = [event for event in associated if event["event"] == "input_command"]
+                self.assertTrue(all(event["method"] == "mouse.wheel" for event in commands))
+                self.assertEqual(tuple(map(sum, zip(*(event["arguments"] for event in commands), strict=True))),
+                                 (scroll["action"]["dx"], scroll["action"]["dy"]))
+                wheels = [event["input"] for event in associated if event["event"] == "input_event"
+                          and event["input"]["type"] == "wheel"]
+                self.assertGreater(len(wheels), 8)
+                self.assertTrue(all(event["trusted"] and (event["x"], event["y"]) == (150, 120) for event in wheels))
+                self.assertGreater(wheels[-1]["browser_time_ms"] - wheels[0]["browser_time_ms"], 100)
+
     async def test_live_recording_correlates_model_text_keys_and_observed_motion(self):
         actions = iter([
             {"type": "act", "action": {"type": "type", "x": 150, "y": 40, "text": "Fern Creek"}},
