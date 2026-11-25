@@ -1,19 +1,22 @@
 import asyncio
-from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager
+import re
+from collections.abc import AsyncIterator, Awaitable, Callable
+from contextlib import asynccontextmanager, nullcontext
+from hashlib import sha256
 from pathlib import Path
 from time import monotonic
-from typing import TypedDict
+from typing import NotRequired, TypedDict
 from urllib.parse import urlsplit
 from uuid import uuid4
 
-from playwright.async_api import ConsoleMessage, Error, Page, Response, Route, WebSocketRoute, async_playwright
+from playwright.async_api import ConsoleMessage, Error, Locator, Page, Response, Route, WebSocketRoute, async_playwright
 from playwright.async_api import TimeoutError as PlaywrightTimeout
 from pydantic import HttpUrl
 
 from logs import EventSink, RunEvents
 
-from .actions import MAX_STEPS, Action, Back, Click, Hover, Navigate, Scroll, TypeText, Wait
+from .actions import MAX_STEPS, Action, Back, Click, FindText, Hover, Navigate, PressKey, Scroll, TypeText, Wait
+from .recording import HIDE_RECORDING_POINTER, InputRecording
 
 VIEWPORT = {"width": 1280, "height": 720}
 ACTION_TIMEOUT = 10
@@ -21,11 +24,99 @@ RUN_TIMEOUT = 90
 CLICK_NAVIGATION_TIMEOUT_MS = 250
 
 
+class ActionEffect(TypedDict):
+    visual_change: bool
+    url_changed: bool
+    document_scroll_changed: bool
+    editable_focused: bool
+    document_scroll_y: NotRequired[int]
+    visual_cycle: NotRequired[bool]
+    clicked_disclosure_open: NotRequired[bool]
+    rejected: NotRequired[str]
+
+
+class ControlHint(TypedDict):
+    label: str
+    kind: str
+    x: int
+    y: int
+    expanded: NotRequired[bool]
+
+
 class PageObservation(TypedDict):
     observation_id: str
     url: str
     title: str
     screenshot: str
+    effect: NotRequired[ActionEffect]
+    controls: NotRequired[list[ControlHint]]
+    visible_text: NotRequired[list[str]]
+
+
+_IS_EDITABLE = """(point) => {
+    const element = point ? document.elementFromPoint(point.x, point.y) : document.activeElement;
+    return Boolean(element && !element.disabled && !element.readOnly && (
+        element.isContentEditable || element.tagName === 'TEXTAREA' ||
+        element.tagName === 'INPUT' && ['text', 'search', 'email', 'url', 'tel', 'password', 'number'].includes(element.type)
+    ));
+}"""
+
+_VISIBLE_CONTROLS = r"""() => {
+    const controls = [];
+    for (const element of document.querySelectorAll(
+        'a[href], button, summary, input:not([type=hidden]):not([type=password]), textarea, select, [role=button], [role=tab]'
+    )) {
+        if (element.matches(':disabled, [aria-disabled=true]')) continue;
+        if (getComputedStyle(element).visibility !== 'visible') continue;
+        const rect = element.getBoundingClientRect();
+        const left = Math.max(0, rect.left), right = Math.min(innerWidth, rect.right);
+        const top = Math.max(0, rect.top), bottom = Math.min(innerHeight, rect.bottom);
+        if (right - left < 4 || bottom - top < 4) continue;
+        const x = Math.floor((left + right) / 2), y = Math.floor((top + bottom) / 2);
+        if (!element.contains(document.elementFromPoint(x, y))) continue;
+        const label = (
+            element.getAttribute('aria-label') || element.labels?.[0]?.innerText ||
+            element.getAttribute('placeholder') || element.innerText || element.getAttribute('title') || ''
+        ).replace(/\s+/g, ' ').trim().slice(0, 100);
+        if (!label) continue;
+        const role = element.getAttribute('role');
+        const kind = role === 'button' || role === 'tab' ? role : element.localName;
+        const control = {label, kind, x, y};
+        const expanded = element.getAttribute('aria-expanded');
+        if (expanded === 'true' || expanded === 'false') {
+            control.expanded = expanded === 'true';
+        } else if (kind === 'summary' && element.parentElement?.tagName === 'DETAILS') {
+            control.expanded = element.parentElement.open;
+        }
+        controls.push(control);
+        if (controls.length === 32) break;
+    }
+    return controls;
+}"""
+
+_VISIBLE_TEXT = r"""() => {
+    const root = document.querySelector('main, [role="main"], #body') || document.body;
+    const blocks = [];
+    let remaining = 1800;
+    for (const element of root.querySelectorAll('h1, h2, h3, p, dd, dt, li')) {
+        if (element.tagName === 'LI' && element.querySelector('p, ul, ol')) continue;
+        const rect = element.getBoundingClientRect();
+        if (rect.width <= 0 || rect.height <= 0 || rect.top < 0 || rect.bottom > innerHeight
+                || rect.left < 0 || rect.right > innerWidth) continue;
+        if (getComputedStyle(element).visibility !== 'visible') continue;
+        if (!element.contains(document.elementFromPoint(rect.left + rect.width / 2, rect.top + rect.height / 2))) continue;
+        const text = element.innerText.replace(/\s+/g, ' ').trim();
+        if (!text || text.length > remaining) continue;
+        blocks.push(text);
+        remaining -= text.length;
+        if (remaining < 40 || blocks.length === 24) break;
+    }
+    return blocks;
+}"""
+
+
+class ActionRejected(ValueError):
+    """The page stayed usable after rejecting an action."""
 
 
 def origin(url: str) -> tuple[str, str | None, int | None]:
@@ -38,15 +129,23 @@ def origin(url: str) -> tuple[str, str | None, int | None]:
 class BrowserWorker:
     """Execute one action at a time and record the resulting browser state."""
 
-    def __init__(self, page: Page, target: HttpUrl, output: Path, emit: EventSink) -> None:
+    def __init__(
+        self, page: Page, target: HttpUrl, output: Path, emit: EventSink, *, control_hints: bool = False,
+        timeout_seconds: float = RUN_TIMEOUT, text_hints: bool = False, recording: InputRecording | None = None,
+    ) -> None:
         self._page = page
         self._origin = origin(str(target))
         self._output = output
         self._emit = emit
+        self._control_hints = control_hints
+        self._text_hints = text_hints
+        self._recording = recording
         self._step = 0
         self._lock = asyncio.Lock()
-        self._deadline = monotonic() + RUN_TIMEOUT
+        self._deadline = monotonic() + timeout_seconds
         self._last_observation_id: str | None = None
+        self._last_visual_hash: bytes | None = None
+        self._previous_visual_hash: bytes | None = None
         self._active_action: dict[str, str] = {}
 
     def _record(self, event: str, **fields: object) -> None:
@@ -72,10 +171,36 @@ class BrowserWorker:
         if response.status >= 400:
             self._record("http_error", url=response.url, status=response.status)
 
-    async def _observe(self, step: int) -> PageObservation:
+    async def _wait_for_navigation(self, before_url: str) -> None:
+        try:
+            await self._page.wait_for_url(
+                lambda url: url != before_url, wait_until="commit", timeout=CLICK_NAVIGATION_TIMEOUT_MS,
+            )
+        except PlaywrightTimeout:
+            pass  # Many interactions update only the current page.
+
+    def _named_links(self, text: str) -> Locator:
+        return self._page.get_by_role("link", name=re.compile(re.escape(text), re.IGNORECASE))
+
+    async def has_offscreen_named_link(self, text: str) -> bool:
+        links = self._named_links(text)
+        if await links.count() != 1:
+            return False
+        href = await links.get_attribute("href", timeout=1000)
+        if not href or not await links.is_visible():
+            return False
+        url = await links.evaluate("(link) => link.href")
+        if origin(url) != self._origin:
+            return False
+        box = await links.bounding_box(timeout=1000)
+        return bool(box and (box["y"] >= VIEWPORT["height"] or box["y"] + box["height"] <= 0))
+
+    async def _observe(
+        self, step: int, *, action: Action, before_url: str, before_scroll: list[int] | None,
+    ) -> PageObservation:
         page = self._page
         await page.wait_for_load_state("domcontentloaded")
-        image = await page.screenshot(scale="css")
+        image = await page.screenshot(scale="css", style=HIDE_RECORDING_POINTER if self._recording else None)
         title = await page.title()
         url = page.url
         if origin(url) != self._origin:
@@ -84,7 +209,44 @@ class BrowserWorker:
         path = self._output / screenshot
         path.parent.mkdir(exist_ok=True)
         path.write_bytes(image)
-        return {"observation_id": uuid4().hex, "url": url, "title": title, "screenshot": screenshot}
+        observation: PageObservation = {
+            "observation_id": uuid4().hex, "url": url, "title": title, "screenshot": screenshot,
+        }
+        digest = sha256(image).digest()
+        if self._last_visual_hash is not None and before_scroll is not None:
+            scroll = await page.evaluate("() => [scrollX, scrollY]")
+            observation["effect"] = {
+                "visual_change": digest != self._last_visual_hash,
+                "url_changed": url != before_url,
+                "document_scroll_changed": scroll != before_scroll,
+                "document_scroll_y": round(scroll[1]),
+                "editable_focused": await page.evaluate(_IS_EDITABLE),
+            }
+            if digest == self._previous_visual_hash and digest != self._last_visual_hash:
+                observation["effect"]["visual_cycle"] = True
+            if isinstance(action, Click) and url == before_url:
+                disclosure = await page.evaluate("""({x, y}) => {
+                    const control = document.elementFromPoint(x, y)?.closest('summary, [aria-expanded]');
+                    const expanded = control?.getAttribute('aria-expanded');
+                    if (expanded === 'true' || expanded === 'false') return expanded === 'true';
+                    if (control?.tagName === 'SUMMARY' && control.parentElement?.tagName === 'DETAILS') {
+                        return control.parentElement.open;
+                    }
+                    return null;
+                }""", {"x": action.x, "y": action.y})
+                if disclosure is not None:
+                    observation["effect"]["clicked_disclosure_open"] = disclosure
+        if self._control_hints:
+            observation["controls"] = await page.evaluate(_VISIBLE_CONTROLS)
+        if self._text_hints:
+            observation["visible_text"] = await page.evaluate(_VISIBLE_TEXT)
+        self._previous_visual_hash, self._last_visual_hash = self._last_visual_hash, digest
+        return observation
+
+    async def _dispatch_input(self, method: str, dispatch: Callable[..., Awaitable[None]], *arguments, **options) -> None:
+        if self._recording:
+            self._recording.command(self._active_action, method, arguments, options)
+        await dispatch(*arguments, **options)
 
     async def _perform(self, action: Action) -> None:
         page = self._page
@@ -98,40 +260,54 @@ class BrowserWorker:
             case Click(x=x, y=y) | Hover(x=x, y=y):
                 if isinstance(action, Click):
                     before_url = page.url
-                    await page.mouse.click(x, y)
-                    try:
-                        await page.wait_for_url(
-                            lambda url: url != before_url, wait_until="commit", timeout=CLICK_NAVIGATION_TIMEOUT_MS,
-                        )
-                    except PlaywrightTimeout:
-                        pass  # Many clicks update only the current page.
+                    await self._dispatch_input("mouse.click", page.mouse.click, x, y)
+                    await self._wait_for_navigation(before_url)
                 else:
-                    await page.mouse.move(x, y)
+                    await self._dispatch_input("mouse.move", page.mouse.move, x, y)
             case Scroll(dx=dx, dy=dy):
-                await page.mouse.wheel(dx, dy)
+                await self._dispatch_input("mouse.wheel", page.mouse.wheel, dx, dy)
                 await page.evaluate("""() => new Promise(resolve => {
                     requestAnimationFrame(() => requestAnimationFrame(() => resolve()));
                 })""")
             case Back():
                 await page.go_back(wait_until="domcontentloaded")
             case TypeText(x=x, y=y, text=text):
-                await page.mouse.click(x, y)
-                editable = await page.evaluate("""() => {
-                    const element = document.activeElement;
-                    return Boolean(element && !element.disabled && !element.readOnly && (
-                        element.isContentEditable || element.tagName === 'TEXTAREA' ||
-                        element.tagName === 'INPUT' && ['text', 'search', 'email', 'url', 'tel', 'password', 'number'].includes(element.type)
-                    ));
-                }""")
-                if not editable:
-                    raise ValueError("Text entry requires an editable field at the supplied coordinates.")
-                await page.keyboard.press("ControlOrMeta+A")
-                await page.keyboard.insert_text(text)
+                if not await page.evaluate(_IS_EDITABLE, {"x": x, "y": y}):
+                    raise ActionRejected("Text entry requires an editable field at the supplied coordinates.")
+                await self._dispatch_input("mouse.click", page.mouse.click, x, y)
+                if not await page.evaluate(_IS_EDITABLE):
+                    raise ActionRejected("The editable target did not receive focus. Recheck the visible field.")
+                await self._dispatch_input("keyboard.press", page.keyboard.press, "ControlOrMeta+A")
+                await self._dispatch_input("keyboard.insert_text", page.keyboard.insert_text, text)
+            case PressKey(key=key):
+                if key == "Enter":
+                    allowed = await page.evaluate("""() => {
+                        const field = document.activeElement;
+                        const form = field?.form;
+                        return field?.matches('input[type="search"], input[name="q"]') &&
+                            form?.method === 'get' && new URL(form.action).origin === location.origin;
+                    }""")
+                    if not allowed:
+                        raise ActionRejected("Enter requires focus in a search input in a same-origin GET form.")
+                before_url = page.url
+                await self._dispatch_input("keyboard.press", page.keyboard.press, key)
+                if key == "Enter":
+                    await self._wait_for_navigation(before_url)
+            case FindText(text=text, links_only=links_only):
+                matches = self._named_links(text) if links_only else page.get_by_text(text, exact=False)
+                for index in range(min(await matches.count(), 40)):
+                    match = matches.nth(index)
+                    if await match.is_visible():
+                        await match.scroll_into_view_if_needed(timeout=2000)
+                        break
+                else:
+                    raise ActionRejected("No displayed text matched the query on this page.")
             case Wait(ms=ms):
                 await asyncio.sleep(ms / 1000)
 
     async def execute(
         self, action: Action, *, action_id: str | None = None, decision_id: str | None = None,
+        recover_rejection: bool = False,
     ) -> PageObservation:
         async with self._lock:
             if self._step >= MAX_STEPS:
@@ -147,6 +323,8 @@ class BrowserWorker:
             self._active_action = {"action_id": action_id or uuid4().hex}
             if decision_id is not None:
                 self._active_action["decision_id"] = decision_id
+            if self._recording:
+                self._recording.begin_action(self._active_action)
             try:
                 remaining = self._deadline - started
                 if remaining <= 0:
@@ -154,8 +332,21 @@ class BrowserWorker:
                 async with asyncio.timeout(min(ACTION_TIMEOUT, remaining)):
                     if not isinstance(action, Navigate) and origin(self._page.url) != self._origin:
                         raise ValueError("Navigate to the target before interacting with the page.")
-                    await self._perform(action)
-                    state = await self._observe(self._step)
+                    before_scroll = None
+                    if self._last_observation_id is not None:
+                        before_scroll = await self._page.evaluate("() => [scrollX, scrollY]")
+                    rejection = None
+                    try:
+                        await self._perform(action)
+                    except ActionRejected as error:
+                        if not recover_rejection:
+                            raise ValueError(str(error)) from error
+                        rejection = str(error)
+                    state = await self._observe(
+                        self._step, action=action, before_url=fields["before_url"], before_scroll=before_scroll,
+                    )
+                    if rejection is not None and "effect" in state:
+                        state["effect"]["rejected"] = rejection
             except (Error, ValueError, TimeoutError, asyncio.CancelledError) as error:
                 self._record(
                     "action", **fields, status="failed", after_url=self._page.url,
@@ -165,32 +356,46 @@ class BrowserWorker:
                 raise
             else:
                 self._record(
-                    "action", **fields, status="ok", after_url=state["url"],
+                    "action", **fields, status="rejected" if rejection is not None else "ok", after_url=state["url"],
                     duration_ms=round((monotonic() - started) * 1000), observation=state,
                 )
                 self._last_observation_id = state["observation_id"]
                 return state
             finally:
+                if self._recording:
+                    self._recording.end_action()
                 self._active_action = {}
 
 
 @asynccontextmanager
 async def browser_worker(
     target: HttpUrl, output: Path, *, headed: bool = False, events: RunEvents | None = None,
+    control_hints: bool = False, inspect_final: Callable[[Page], Awaitable[None]] | None = None,
+    timeout_seconds: float = RUN_TIMEOUT, text_hints: bool = False, record_input: bool = False,
 ) -> AsyncIterator[BrowserWorker]:
     if target.username is not None:
         raise ValueError("The target URL must not contain credentials.")
     output.mkdir(parents=True, exist_ok=False)
     run_events = events if events is not None else RunEvents()
-    with run_events.open_log(output / "actions.jsonl", source="browser") as emit:
+    input_log = run_events.open_log(output / "inputs.jsonl", source="input") if record_input else nullcontext()
+    with run_events.open_log(output / "actions.jsonl", source="browser") as emit, input_log as emit_input:
+        recording = InputRecording(output, emit_input) if emit_input else None
         async with async_playwright() as playwright:
             browser = await playwright.chromium.launch(headless=not headed)
             try:
                 context = await browser.new_context(
                     viewport=VIEWPORT, accept_downloads=False, service_workers="block",
+                    record_video_dir=output / "videos" if recording else None,
+                    record_video_size=VIEWPORT if recording else None,
                 )
+                if recording:
+                    await recording.install(context)
                 page = await context.new_page()
-                worker = BrowserWorker(page, target, output, emit)
+                worker = BrowserWorker(
+                    page, target, output, emit, control_hints=control_hints,
+                    timeout_seconds=timeout_seconds, text_hints=text_hints,
+                    recording=recording,
+                )
                 page.on("console", worker._console_message)
                 page.on("pageerror", lambda error: worker._record("page_error", url=page.url, message=str(error)))
                 context.on("requestfailed", lambda request: worker._record(
@@ -204,7 +409,13 @@ async def browser_worker(
                 try:
                     yield worker
                 finally:
-                    await context.tracing.stop(path=output / "trace.zip")
-                    await context.close()
+                    try:
+                        await context.tracing.stop(path=output / "trace.zip")
+                        if inspect_final is not None:
+                            await inspect_final(page)
+                    finally:
+                        await context.close()
+                        if recording:
+                            await recording.finish()
             finally:
                 await browser.close()

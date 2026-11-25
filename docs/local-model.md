@@ -31,6 +31,10 @@ The model server listens at `http://127.0.0.1:8081`, with one 8192-token context
 uv run --locked python -m http.server 8765 --bind 127.0.0.1 --directory mock
 ```
 
+显存余量不足时，可以给启动脚本传入 `-GpuLayers 22` 等较低值。若推理较慢，可在 Agent CLI 中用 `--run-timeout 180 --model-timeout 45` 调整预算。
+
+If free VRAM is limited, pass a lower value such as `-GpuLayers 22` to the startup script. For slower inference, adjust the Agent CLI budgets with `--run-timeout 180 --model-timeout 45`.
+
 ## 自主探索 / Autonomous exploration
 
 `local` 提供方调用本机 `/v1/chat/completions`，不使用 OpenAI/OpenRouter API key。截图以图像输入发送至回环地址。使用 JSON Schema 约束动作，并由现有 `DecisionAdapter` 将 0–1000 坐标转换为截图像素；浏览器操作仍由真实模型逐步选择。

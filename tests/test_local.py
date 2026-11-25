@@ -10,6 +10,13 @@ from models.local import LocalProvider
 
 
 class LocalProviderTest(unittest.IsolatedAsyncioTestCase):
+    def test_named_scroll_direction_controls_delta_sign(self):
+        for operation, expected in (("scroll_down", 300), ("scroll_up", -300)):
+            reply = FlatDecision(reason="Scroll to read the page.", operation=operation,
+                                 x=0, y=0, dx=0, dy=-300, ms=0, text="")
+            decision = DECISION.validate_json(reply.decision_json(1280, 720))
+            self.assertEqual(decision.action.model_dump(), {"type": "scroll", "dx": 0, "dy": expected})
+
     async def test_text_decision_preserves_literal_query_and_normalizes_target(self):
         query = 'Fern Creek Loop "溪流"'
         value = {"operation":"type", "reason":"Search the directory.", "x":500, "y":500,

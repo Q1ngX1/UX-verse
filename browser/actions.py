@@ -40,11 +40,24 @@ class Back(BrowserAction):
     type: Literal["back"] = "back"
 
 
+class PressKey(BrowserAction):
+    type: Literal["key"] = "key"
+    key: Literal["Tab", "Shift+Tab", "Escape", "ArrowUp", "ArrowDown", "Enter"]
+
+
+class FindText(BrowserAction):
+    type: Literal["find"] = "find"
+    text: Annotated[str, Field(min_length=1, max_length=200)]
+    links_only: bool = False
+
+
 class Wait(BrowserAction):
     type: Literal["wait"] = "wait"
     ms: Annotated[int, Field(ge=0, le=2000)]
 
 
-Action = Annotated[Navigate | Click | Hover | Scroll | TypeText | Back | Wait, Field(discriminator="type")]
+Action = Annotated[
+    Navigate | Click | Hover | Scroll | TypeText | Back | PressKey | FindText | Wait, Field(discriminator="type"),
+]
 MAX_STEPS = 30
 ACTION_LIST = TypeAdapter(Annotated[list[Action], Field(max_length=MAX_STEPS - 1)])

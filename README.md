@@ -182,9 +182,74 @@ async def explore():
 print(asyncio.run(explore()))
 ```
 
-引擎先打开起始页，然后逐轮提交截图、可见页面元数据和动作历史。模型可以建议点击、悬停、输入文字、滚动、返回或等待，也可以报告完成或放弃。文字输入动作包含截图坐标与最多 1000 字符的文本，执行器仅检查目标是否可编辑，不向模型返回 DOM 内容。模型输出无效或遇到可重试错误时，每轮可再请求一次。初始导航独立于动作预算，最后一步之后仍可根据最新观测报告完成。`completed` 表示模型报告任务已完成。
+引擎先打开起始页，然后逐轮提交截图、可见页面元数据和动作历史。模型可以建议点击、悬停、输入文字、滚动、按键、页内查找、返回或等待，也可以报告完成或放弃。文字输入动作包含截图坐标与最多 1000 字符的文本。模型输出无效或遇到可重试错误时，每轮可再请求一次。初始导航独立于动作预算，最后一步之后仍可根据最新观测报告完成。`completed` 表示模型报告任务已完成。
 
-The engine opens the start page, then supplies each turn with a screenshot, visible page metadata, and action history. The model can propose a click, hover, text entry, scroll, back, or wait, or report completion or abandonment. Text entry includes screenshot coordinates and up to 1000 characters; the executor checks only target editability and does not return DOM content to the model. An invalid response or retryable error allows one retry per turn. Initial navigation is outside the action budget, and the model can still report completion after observing the final permitted action. `completed` means the model reported task completion.
+The engine opens the start page, then supplies each turn with a screenshot, visible page metadata, and action history. The model can propose a click, hover, text entry, scroll, key press, in-page find, back, or wait, or report completion or abandonment. Text entry includes screenshot coordinates and up to 1000 characters. An invalid response or retryable error allows one retry per turn. Initial navigation is outside the action budget, and the model can still report completion after observing the final permitted action. `completed` means the model reported task completion.
+
+### 动作反馈与控件提示 / Action feedback and control hints
+
+模型适配器默认带上最近六步动作及其结果，包括 URL、画面和文档滚动位置是否变化，以及可编辑控件是否处于焦点。连续点击无明显变化、滚动无效果或输入未命中时，模型可以依据反馈重新选择动作。浏览器 CLI 仍把无效输入目标作为失败报告。
+
+The model adapter includes the last six actions and their effects by default, covering URL, screenshot and document scroll changes and whether an editable control is focused. The model can reconsider after repeated clicks, a scroll with no effect, or a rejected text target. The standalone browser CLI still reports invalid text targets as failures.
+
+连续两次点击同一位置或执行相同滚动，且 URL、画面和文档滚动位置均未变化时，引擎会拦截下一次重复动作并请求模型重新决策。模型仍然重复时，运行以 `stalled` 结束，日志保留未派发的决策。
+
+After two unchanged clicks at the same point or two unchanged identical scrolls, the engine intercepts a further repeat and asks the model to choose a different action. A second repeated proposal ends the run as `stalled`. The log preserves the undispatched decisions.
+
+在同一展开控件上来回点击时，引擎也会结合画面回到先前状态的信号与展开状态，提示 Agent 阅读已展开的内容。控件提示可提供当前的展开或折叠状态。
+
+For repeated disclosure clicks, the engine also uses a return to the earlier screenshot and the disclosure state to ask the agent to read the open content. Control hints can include the current expanded or collapsed state.
+
+Agent 支持 Tab、Shift+Tab、Escape、上下方向键和受限的 Enter。Enter 只用于已聚焦的同源 GET 搜索表单。用 `--control-hints` 可在截图之外提供可见控件的标签与坐标。该模式会将这些标签写入观测日志，并随当前截图提供给选定的模型。
+
+The agent supports Tab, Shift+Tab, Escape, the up and down arrow keys, and limited Enter. Enter requires a focused search input in a same-origin GET form. Use `--control-hints` to include visible control labels and coordinates alongside the screenshot. This mode records those labels in the observation log and sends them to the selected model with the screenshot.
+
+`--text-hints` 可以附带视口内完整显示的短文本块，帮助模型读取数值和说明。开启后文本会写入观测日志，并发送给选定的模型。Agent 可以用独立的 `answer` 字段报告所读取的内容，日志继续保留停止理由。
+
+`--text-hints` can include short text blocks that are fully in the viewport to help the model read values and instructions. When enabled, this text is recorded in observations and sent to the selected model. The agent can return a separate `answer` with the facts it found, while the log retains its reason for stopping.
+
+`find` 可以在当前页查找字面短语，并把第一个已显示的匹配滚动到视口。找到链接后，Agent 可根据新截图决定是否点击。折叠区域仍需由 Agent 主动展开。
+
+`find` searches the current page for a literal phrase and scrolls the first displayed match into the viewport. The resulting screenshot lets the agent decide whether to follow a matching link. Collapsed content still requires the agent to open it.
+
+开启控件提示后，如果任务明确要求打开一个带引号的名称或函数名，且起始页只有一个匹配的同源链接位于视口外，引擎可先定位该链接，再由模型决定是否跟随。定位计入动作预算并写入日志。
+
+With control hints enabled, when a task asks to open a quoted name or function name and the start page has a single matching same-origin link below or above the viewport, the engine can locate it first. The model decides whether to follow it. The find action consumes one step and is logged.
+
+### Explorer 实测基准 / Explorer live benchmark
+
+启动本地视觉模型后，从仓库根目录运行以下命令。工具会启动独立 Waymark 服务，并测试 Waymark、Python 3.12 文档和 IANA 公开页面。每轮交叉检查最终页面、视口中的预期内容和模型回答。运行结果及截图、浏览器日志和 trace 会保存在新建的 `runs/benchmark-*` 目录中。
+
+Start the local vision model and run the following from the repository root. The tool starts an isolated Waymark server and tests Waymark, the Python 3.12 docs, and public IANA pages. Each run checks the final page, the expected content in the viewport, and the model answer. Results, screenshots, browser logs, and traces are saved in a new `runs/benchmark-*` directory.
+
+```sh
+uv run --locked python -m tools.explorer_benchmark --repeats 2 --control-hints --text-hints
+```
+
+### 实跑视频与输入录制 / Live video and input recording
+
+为 `python -m agent`、`python -m browser` 或 `python -m tools.explorer_benchmark` 加上 `--record-input`，即可在浏览器运行期间同步录制。无头和可见窗口都可以使用。录制依赖 Playwright 的视频组件，缺失时运行 `uv run --locked playwright install ffmpeg`。
+
+Add `--record-input` to `python -m agent`, `python -m browser`, or `python -m tools.explorer_benchmark` to capture the live browser run. The recorder works in both headless and headed Chromium. If Playwright's video runtime is missing, run `uv run --locked playwright install ffmpeg`.
+
+| 文件 / File | 内容 / Contents |
+| --- | --- |
+| `videos/*.webm` | Playwright 编码的页面视频。指针随浏览器产生的实际指针事件在录制时更新。 Playwright page video. The pointer overlay updates live from browser-generated pointer events. |
+| `agent.jsonl`、`actions.jsonl` | 模型选中的决策和浏览器执行结果，包含所选输入文字和虚拟键。 Model decisions and executed actions, including chosen text and virtual keys. |
+| `inputs.jsonl` | 下发命令和浏览器收到的指针、点击、滚轮、按键、文字插入及组合输入事件。 Dispatch commands and observed pointer, click, wheel, key, text input, and composition events. |
+| `recording.json` | 录制状态、页面 ID 与视频轨道路径。 Recording status, page IDs, and video track paths. |
+
+输入事件携带浏览器事件时间、页面与 frame ID，以及 frame 内 CSS 像素坐标。浏览器提供合并采样时，也会保存这些中间点。命令、浏览器动作和模型决定通过运行 ID、动作 ID 与决策 ID 关联。未来的连续移动模块只要向 Chromium 下发真实输入事件，中间轨迹就会被独立采集。视频按帧采样，验证细节时可查事件日志。模型截图会隐藏录制指针。采集范围是浏览器页面，包含在页面中收到的系统输入。
+
+Input events carry browser event time, page and frame IDs, and frame-local CSS-pixel coordinates. Coalesced samples are preserved when Chromium supplies them. Commands, browser actions, and model decisions are linked by run, action, and decision IDs. A future continuous movement backend can supply real Chromium input events and the recorder will observe those intermediate positions independently. The event log preserves detail between video frames. Model screenshots hide the recording pointer. The capture covers browser pages, including native input delivered to them.
+
+指针有实际位置后，在停顿和同一页面窗口内导航时会保留其最后位置，直到收到新的输入或指针离开视口。
+
+Once the recorder has observed a pointer position, it retains that position during pauses and navigation in the same page window until new input arrives or the pointer leaves the viewport.
+
+录制会保存实际输入的键和文字，请仅对可以保留此类输入的会话启用。
+
+Recording stores actual keys and entered text. Enable it for sessions where those inputs can be retained.
 
 ### 时序分析与视频 / Temporal and video analysis
 

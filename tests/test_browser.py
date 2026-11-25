@@ -32,9 +32,22 @@ class TestSite(BaseHTTPRequestHandler):
         content_type = "text/html; charset=utf-8"
         if self.path == "/search":
             body = '''<!doctype html><title>Search fixture</title>
-                <style>body {margin:0} input {position:absolute;left:20px;top:20px;width:300px;height:50px}</style>
+                <style>body {margin:0} input {position:absolute;left:20px;top:20px;width:300px;height:50px}
+                a {position:absolute;left:375px;top:375px;width:100px;height:60px}</style>
                 <form onsubmit="document.title='Unexpected submission';return false">
-                <input type="search" value="Old query" oninput="document.title='Query: '+this.value"></form>'''
+                <input type="search" value="Old query" oninput="document.title='Query: '+this.value"></form>
+                <a href="/next">Unrelated link</a>'''
+        elif self.path == "/keyboard-search":
+            body = '''<!doctype html><title>Keyboard search</title>
+                <style>body {margin:0} input {position:absolute;left:20px;top:20px;width:300px;height:50px}</style>
+                <form action="/next" method="get"><input type="search" name="q"></form>'''
+        elif self.path == "/next?q=Fern+Creek":
+            body = "<!doctype html><title>Keyboard results</title><h1>Fern Creek</h1>"
+        elif self.path == "/disclosure":
+            body = '''<!doctype html><title>Disclosure fixture</title>
+                <style>body{margin:0;min-height:1600px} summary{height:48px}</style>
+                <details><summary>Show answer</summary><p>Answer inside.</p></details>
+                <a style="position:absolute;top:1400px" href="/next">Offscreen link</a>'''
         elif self.path == "/next":
             body = '<title>Loading next page</title><h1></h1><script defer src="/next.js"></script>'
         elif self.path == "/next.js":
@@ -172,8 +185,195 @@ class BrowserSmokeTest(LocalSite, unittest.TestCase):
             self.assertEqual(last["error"]["type"], "ValueError")
             self.assertTrue(zipfile.is_zipfile(output / "trace.zip"))
 
+    def test_enter_is_allowed_only_for_focused_get_search(self):
+        with tempfile.TemporaryDirectory() as directory:
+            process, output = self.run_browser(Path(directory), [
+                {"type": "navigate", "url": self.url + "keyboard-search"},
+                {"type": "type", "x": 150, "y": 40, "text": "Fern Creek"},
+                {"type": "key", "key": "Enter"},
+            ])
+            self.assertEqual(process.returncode, 0, process.stderr)
+            actions = [event for event in self.events(output) if event["event"] == "action"]
+            self.assertEqual(actions[-1]["observation"]["title"], "Keyboard results")
+            self.assertTrue(actions[-1]["observation"]["effect"]["url_changed"])
+
+        with tempfile.TemporaryDirectory() as directory:
+            process, _ = self.run_browser(Path(directory), [{"type": "key", "key": "Enter"}])
+            self.assertEqual(process.returncode, 1)
+            self.assertIn("same-origin GET form", process.stderr)
+
+    def test_find_scrolls_to_displayed_text_without_pursuing_links_or_hidden_matches(self):
+        with tempfile.TemporaryDirectory() as directory:
+            process, output = self.run_browser(Path(directory), [
+                {"type": "navigate", "url": self.url + "disclosure"},
+                {"type": "find", "text": "Offscreen link"},
+            ])
+            self.assertEqual(process.returncode, 0, process.stderr)
+            actions = [event for event in self.events(output) if event["event"] == "action"]
+            self.assertEqual(actions[-1]["after_url"], self.url + "disclosure")
+            self.assertTrue(actions[-1]["observation"]["effect"]["document_scroll_changed"])
+        with tempfile.TemporaryDirectory() as directory:
+            process, _ = self.run_browser(Path(directory), [
+                {"type": "navigate", "url": self.url + "disclosure"},
+                {"type": "find", "text": "Answer inside"},
+            ])
+            self.assertEqual(process.returncode, 1)
+            self.assertIn("No displayed text matched", process.stderr)
+
 
 class AgentSmokeTest(LocalSite, unittest.IsolatedAsyncioTestCase):
+    async def test_live_recording_correlates_model_text_keys_and_observed_motion(self):
+        actions = iter([
+            {"type": "act", "action": {"type": "type", "x": 150, "y": 40, "text": "Fern Creek"}},
+            {"type": "act", "action": {"type": "key", "key": "ArrowDown"}},
+            {"type": "act", "action": {"type": "key", "key": "Enter"}},
+            {"type": "stop", "outcome": "completed"},
+        ])
+
+        class TestModel:
+            async def decide(self, request):
+                return ModelReply(json.dumps({**next(actions), "reason": "Find the search result."}))
+
+        async def inspect_final(page):
+            self.assertEqual(await page.title(), "Keyboard results")
+            cursor = page.locator("[data-uxverse-recording-pointer]")
+            await cursor.wait_for(state="attached", timeout=2000)
+            self.assertEqual(await cursor.evaluate("(node) => node.style.transform"), "translate(150px, 40px)")
+            self.assertEqual(await cursor.evaluate("(node) => node.style.display"), "block")
+            await page.mouse.move(650, 420, steps=16)
+            await asyncio.sleep(0.15)
+
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "run"
+            config = AgentConfig(
+                target=self.url + "keyboard-search", task="Find Fern Creek.", max_steps=3, record_input=True,
+            )
+            result = await run_agent(config, TestModel(), output, inspect_final=inspect_final)
+            self.assertEqual(result.status, "completed")
+            decision = [row for row in self.events(output, "agent.jsonl")
+                        if row["event"] == "model_decision" and "action_id" in row]
+            events = self.events(output, "inputs.jsonl")
+            commands = [row for row in events if row["event"] == "input_command"]
+            delivered = [row for row in events if row["event"] == "input_event"]
+            self.assertEqual({row["run_id"] for row in events}, {decision[0]["run_id"]})
+            self.assertTrue(any(row["method"] == "keyboard.insert_text" and row["arguments"] == ["Fern Creek"]
+                                and row["action_id"] == decision[0]["action_id"] for row in commands))
+            self.assertTrue(any(row["input"]["type"] == "input" and row["input"]["data"] == "Fern Creek"
+                                and row.get("decision_id") == decision[0]["decision_id"] for row in delivered))
+            self.assertEqual(
+                {row["input"]["type"] for row in delivered if row["input"].get("key") == "ArrowDown"
+                 and row.get("decision_id") == decision[1]["decision_id"]}, {"keydown", "keyup"},
+            )
+            self.assertTrue(any(row["input"].get("key") == "Enter"
+                                and row.get("decision_id") == decision[2]["decision_id"] for row in delivered))
+            motion = [row for row in delivered if row["input"]["type"] == "pointermove"
+                      and row["frame_url"].endswith("/next?q=Fern+Creek")]
+            self.assertGreaterEqual(len({row["input"]["x"] for row in motion}), 16)
+            self.assertEqual((motion[-1]["input"]["x"], motion[-1]["input"]["y"]), (650, 420))
+            self.assertTrue(all(row["input"]["trusted"] and "action_id" not in row for row in motion))
+            manifest = json.loads((output / "recording.json").read_text(encoding="utf-8"))
+            self.assertEqual(manifest["videos"][0]["page_id"], motion[-1]["page_id"])
+            self.assertGreater((output / manifest["videos"][0]["path"]).stat().st_size, 0)
+
+    async def test_named_offscreen_link_is_located_before_choosing_to_follow_it(self):
+        requests = []
+
+        class TestModel:
+            async def decide(self, request):
+                requests.append(request)
+                if request.observation.title == "Next page":
+                    return ModelReply('{"type":"stop","outcome":"completed","reason":"Opened the named link."}')
+                link = next(control for control in request.observation.controls if control["label"] == "Offscreen link")
+                return ModelReply(json.dumps({"type": "act", "reason": "Follow the visible link.",
+                                              "action": {"type": "click", "x": link["x"], "y": link["y"]}}))
+
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "run"
+            config = AgentConfig(target=self.url + "disclosure", task='Open "Offscreen link".',
+                                 max_steps=2, control_hints=True)
+            result = await run_agent(config, TestModel(), output)
+            self.assertEqual((result.status, result.steps, result.model_calls), ("completed", 2, 2))
+            self.assertEqual(requests[0].history[0].action.type, "find")
+            self.assertEqual(requests[0].observation.title, "Disclosure fixture")
+            self.assertEqual(requests[-1].observation.title, "Next page")
+            self.assertTrue(any(event["event"] == "named_link_located" for event in self.events(output, "agent.jsonl")))
+
+    async def test_disclosure_cycle_preserves_reopen_and_intercepts_next_close(self):
+        calls = []
+
+        class TestModel:
+            async def decide(self, request):
+                calls.append(request)
+                if request.history and request.history[-1].action.type == "scroll":
+                    decision = {"type": "stop", "outcome": "completed", "reason": "Read the open disclosure."}
+                elif request.retry_feedback:
+                    decision = {"type": "act", "action": {"type": "scroll", "dx": 0, "dy": 150},
+                                "reason": "Read below the open disclosure."}
+                else:
+                    decision = {"type": "act", "action": {"type": "click", "x": 40, "y": 20},
+                                "reason": "Click the disclosure."}
+                return ModelReply(json.dumps(decision))
+
+        with tempfile.TemporaryDirectory() as directory:
+            result = await run_agent(
+                AgentConfig(target=self.url + "disclosure", task="Read the answer.", max_steps=4),
+                TestModel(), Path(directory) / "run",
+            )
+            self.assertEqual((result.status, result.steps, result.model_calls), ("completed", 4, 6))
+            self.assertTrue(calls[3].history[-1].effect["visual_cycle"])
+            self.assertIn("disclosure is open", calls[4].retry_feedback)
+
+    async def test_repeated_no_effect_click_gets_a_retry_without_dispatch(self):
+        calls = []
+
+        class TestModel:
+            async def decide(self, request):
+                calls.append(request)
+                if request.observation.title == "Next page":
+                    decision = {"type": "stop", "outcome": "completed", "reason": "Reached the next page."}
+                else:
+                    point = {"x": 20, "y": 20} if request.retry_feedback else {"x": 400, "y": 400}
+                    decision = {"type": "act", "action": {"type": "click", **point}, "reason": "Find the link."}
+                return ModelReply(json.dumps(decision))
+
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "run"
+            result = await run_agent(AgentConfig(target=self.url, task="Open Next.", max_steps=3), TestModel(), output)
+            self.assertEqual((result.status, result.steps, result.model_calls), ("completed", 3, 5))
+            self.assertIn("Two clicks", calls[3].retry_feedback)
+            rejected = [event for event in self.events(output, "agent.jsonl")
+                        if event["event"] == "repeated_action"]
+            self.assertEqual(len(rejected), 1)
+            self.assertNotIn("action_id", rejected[0])
+
+    async def test_invalid_text_target_is_observed_and_agent_can_recover(self):
+        requests: list[DecisionRequest] = []
+        decisions = iter([
+            {"type": "act", "action": {"type": "type", "x": 400, "y": 400, "text": "answer"}},
+            {"type": "act", "action": {"type": "type", "x": 150, "y": 40, "text": "answer"}},
+            {"type": "stop", "outcome": "completed"},
+        ])
+
+        class TestModel:
+            async def decide(self, request):
+                requests.append(request)
+                return ModelReply(json.dumps({**next(decisions), "reason": "Search for an answer."}))
+
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "run"
+            result = await run_agent(
+                AgentConfig(target=self.url + "search", task="Search", max_steps=2), TestModel(), output,
+            )
+            self.assertEqual((result.status, result.steps), ("completed", 2))
+            effect = requests[1].history[-1].effect
+            self.assertIn("editable field", effect["rejected"])
+            self.assertEqual(requests[1].observation.title, "Search fixture")
+            self.assertTrue(requests[2].history[-1].effect["editable_focused"])
+            self.assertEqual(requests[2].observation.title, "Query: answer")
+            actions = [event for event in self.events(output) if event["event"] == "action"]
+            self.assertEqual(actions[1]["status"], "rejected")
+            self.assertEqual(actions[1]["observation"]["effect"], effect)
+
     async def test_agent_explores_through_configured_provider(self):
         calls = []
 
@@ -231,20 +431,35 @@ class AgentSmokeTest(LocalSite, unittest.IsolatedAsyncioTestCase):
             async def decide(self, request):
                 requests.append(request)
                 if request.observation.title == "Next page":
-                    response = {"type": "stop", "outcome": "completed", "reason": "Reached the next page."}
+                    response = {"type": "stop", "outcome": "completed", "reason": "Reached the next page.",
+                                "answer": "Next page"}
                 else:
                     response = {"type": "act", "action": {"type": "click", "x": 20, "y": 20}, "reason": "Open Next."}
                 return ModelReply(json.dumps(response), ModelUsage(input_tokens=12, output_tokens=4))
 
         with tempfile.TemporaryDirectory() as directory:
             output = Path(directory) / "run"
-            config = AgentConfig(target=self.url, task="Open the next page.", persona="First-time visitor", max_steps=1)
-            result = await run_agent(config, TestModel(), output)
+            config = AgentConfig(
+                target=self.url, task="Open the next page.", persona="First-time visitor", max_steps=1,
+                control_hints=True, text_hints=True,
+            )
+            inspected = []
+
+            async def inspect_final(page):
+                self.assertTrue(zipfile.is_zipfile(output / "trace.zip"))
+                inspected.append(await page.title())
+
+            result = await run_agent(config, TestModel(), output, inspect_final=inspect_final)
             self.assertEqual((result.status, result.steps, result.model_calls), ("completed", 1, 2))
+            self.assertEqual(result.answer, "Next page")
+            self.assertEqual(inspected, ["Next page"])
             first, last = requests
             self.assertEqual((first.task, first.persona), (config.task, config.persona))
             self.assertEqual((first.steps_remaining, last.steps_remaining), (1, 0))
             self.assertFalse(first.history)
+            self.assertEqual(first.observation.controls[0]["label"], "Next")
+            self.assertFalse(last.observation.controls)
+            self.assertIn("Next page", last.observation.visible_text)
             self.assertEqual(last.history[0].action, Click(x=20, y=20))
             self.assertEqual(last.history[0].url, self.url + "next")
             self.assertEqual((first.observation.width, first.observation.height), (1280, 720))
