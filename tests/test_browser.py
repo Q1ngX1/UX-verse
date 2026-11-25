@@ -7,17 +7,24 @@ import tempfile
 import threading
 import unittest
 import zipfile
+from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from itertools import pairwise
+from math import hypot
 from pathlib import Path
-from time import sleep
+from random import Random
+from time import perf_counter, sleep
 from unittest.mock import patch
 
 import httpx
 
-from agent.engine import AgentConfig, run_agent
+from agent.engine import MAX_SCROLL_AXIS, REACTION_TIME_MS, AgentConfig, run_agent
 from agent.model import DECISION, DecisionRequest, ModelReply, ModelUsage, RetryableModelError
 from browser.actions import Click
-from browser.input_devices import cursory_trajectory, smooth_wheel_steps
+from browser.input_devices import (
+    DESKTOP_KEY_INTERVAL_MS, MAX_WHEEL_SPEED, MOBILE_KEY_INTERVAL_MS, VirtualKeyboard, VirtualMouse, cursory_trajectory,
+    plan_typing, smooth_wheel_steps,
+)
 from models.decision import DecisionAdapter
 from models.responses import ResponsesProvider
 
@@ -139,16 +146,69 @@ class InputTrajectoryTest(unittest.TestCase):
 
     def test_smooth_wheel_preserves_both_axes_and_eases_to_a_stop(self):
         self.assertEqual(list(smooth_wheel_steps(0, 0)), [])
-        self.assertEqual(list(smooth_wheel_steps(-1, 0)), [((-1, 0), 0)])
+        self.assertEqual(list(smooth_wheel_steps(-1, 0)), [((-1, 0), 1 / MAX_WHEEL_SPEED)])
         for dx, dy in ((120, -600), (-300, 250), (5000, 0)):
             with self.subTest(dx=dx, dy=dy):
-                steps = list(smooth_wheel_steps(dx, dy))
+                steps = list(smooth_wheel_steps(dx, dy, rng=Random(1)))
                 offsets, pauses = zip(*steps, strict=True)
                 self.assertEqual(tuple(map(sum, zip(*offsets, strict=True))), (dx, dy))
                 self.assertTrue(all(x * dx >= 0 and y * dy >= 0 for x, y in offsets))
-                sizes = [abs(x) + abs(y) for x, y in offsets]
-                self.assertGreater(max(sizes), max(sizes[0], sizes[-1]))
-                self.assertLess(sum(pauses), 0.7)
+                speeds = [hypot(*offset) / pause for offset, pause in steps]
+                self.assertGreater(max(speeds), max(speeds[0], speeds[-1]))
+                self.assertLessEqual(max(speeds), MAX_WHEEL_SPEED + 1e-9)
+                self.assertGreater(sum(pauses), hypot(dx, dy) / MAX_WHEEL_SPEED)
+
+    def test_long_wheel_scrolls_pause_and_vary_with_the_sampled_pace(self):
+        first = list(smooth_wheel_steps(0, 1200, rng=Random(1)))
+        second = list(smooth_wheel_steps(0, 1200, rng=Random(2)))
+        self.assertTrue(any(delta == (0, 0) and delay >= 0.11 for delta, delay in first))
+        self.assertNotEqual(sum(delay for _, delay in first), sum(delay for _, delay in second))
+
+    def test_typing_plan_preserves_key_chords_and_adds_a_word_pause(self):
+        cases = (("desktop", DESKTOP_KEY_INTERVAL_MS), ("mobile", MOBILE_KEY_INTERVAL_MS))
+        for device, (minimum, maximum) in cases:
+            with self.subTest(device=device):
+                plan = plan_typing("Ab !", device=device, rng=Random(1))
+                self.assertEqual([key for key, _ in plan], ["ControlOrMeta+A", "Shift+KeyA", "b", "Space", "Shift+Digit1"])
+                self.assertTrue(REACTION_TIME_MS[0] <= plan[0][1] * 1000 <= REACTION_TIME_MS[1])
+                self.assertTrue(all(minimum <= delay * 1000 <= maximum for _, delay in plan[1:-1]))
+                self.assertGreaterEqual(plan[-1][1] * 1000, minimum + 40)
+
+
+class InputPacingTest(unittest.IsolatedAsyncioTestCase):
+    async def test_typing_waits_after_a_delayed_browser_acknowledgement(self):
+        started, finished = [], []
+
+        class SlowKeyboard:
+            async def press(self, key):
+                started.append(perf_counter())
+                if key == "a":
+                    await asyncio.sleep(0.08)
+                finished.append(perf_counter())
+
+        async def dispatch(method, action, *args):
+            await action(*args)
+
+        keyboard = VirtualKeyboard(SlowKeyboard(), dispatch)
+        await keyboard.type_keys([("a", 0), ("b", 0.025)])
+        self.assertGreaterEqual(started[1] - finished[0], 0.024)
+
+    async def test_wheel_does_not_catch_up_after_a_slow_dispatch(self):
+        started = []
+
+        class SlowMouse:
+            async def wheel(self, dx, dy):
+                started.append(perf_counter())
+                if len(started) == 1:
+                    await asyncio.sleep(0.12)
+
+        async def dispatch(method, action, *args):
+            await action(*args)
+
+        mouse = VirtualMouse(SlowMouse(), dispatch, smooth_scroll=True)
+        with patch("browser.input_devices.smooth_wheel_steps", return_value=[((0, 25), 0.025)] * 3):
+            await mouse.wheel(0, 75)
+        self.assertGreaterEqual(started[2] - started[1], 0.024)
 
 
 class BrowserSmokeTest(LocalSite, unittest.TestCase):
@@ -176,14 +236,15 @@ class BrowserSmokeTest(LocalSite, unittest.TestCase):
             click = next(row for row in events if row.get("action", {}).get("type") == "click")
             self.assertEqual(click["after_url"], self.url + "next")
             recorded = [row for row in self.events(output, "inputs.jsonl") if row["event"] == "input_event"]
+            hover_moves = [row["input"] for row in recorded if row.get("action_id") == hover["action_id"]
+                           and row["input"]["type"] == "pointermove"]
             inputs = [row["input"] for row in recorded if row.get("action_id") == click["action_id"]]
             moves = [event for event in inputs if event["type"] == "pointermove"]
             down = next(event for event in inputs if event["type"] == "pointerdown")
-            self.assertTrue(any(row.get("action_id") == hover["action_id"] and row["input"]["type"] == "pointermove"
-                                and 720 < row["input"]["y"] < 820 for row in recorded))
+            self.assertEqual((hover_moves[-1]["x"], hover_moves[-1]["y"]), (360, 820))
             self.assertGreater(len({(event["x"], event["y"]) for event in moves}), 2)
             self.assertTrue(all(event["trusted"] and 0 <= event["x"] < 390 and 0 <= event["y"] < 844
-                                for event in moves))
+                                for event in hover_moves + moves))
             self.assertLess(moves[0]["browser_time_ms"], down["browser_time_ms"])
             self.assertEqual((down["x"], down["y"]), (100, 40))
 
@@ -331,9 +392,25 @@ class BrowserSmokeTest(LocalSite, unittest.TestCase):
 
 
 class AgentSmokeTest(LocalSite, unittest.IsolatedAsyncioTestCase):
+    def assert_typing_paced(self, events, action_id, text, focus_method, minimum_gap):
+        associated = [row for row in events if row.get("action_id") == action_id]
+        focus = next(row for row in associated if row.get("method") == focus_method)
+        presses = [row for row in associated if row.get("method") == "keyboard.press"]
+        self.assertEqual(len(presses), len(text) + 1)
+        self.assertEqual(presses[0]["arguments"], ["ControlOrMeta+A"])
+        self.assertGreaterEqual(presses[0]["command_time_ms"] - focus["command_time_ms"], REACTION_TIME_MS[0] - 5)
+        for previous, current in pairwise(presses):
+            self.assertGreaterEqual(current["command_time_ms"] - previous["command_time_ms"], minimum_gap - 5)
+        typed = [row["input"] for row in associated if row.get("input", {}).get("type") == "input"]
+        self.assertEqual("".join(event["data"] or "" for event in typed), text)
+        self.assertTrue(all(event["trusted"] for event in typed))
+        for previous, current in pairwise(typed):
+            self.assertGreaterEqual(current["browser_time_ms"] - previous["browser_time_ms"], minimum_gap - 15)
+
     async def test_agent_scroll_delivers_timed_wheel_events_to_pointer_container(self):
         decisions = iter([
             {"type": "act", "action": {"type": "hover", "x": 150, "y": 120}},
+            {"type": "act", "action": {"type": "scroll", "dx": 0, "dy": MAX_SCROLL_AXIS + 1}},
             {"type": "act", "action": {"type": "scroll", "dx": 260, "dy": 430}},
             {"type": "act", "action": {"type": "scroll", "dx": -120, "dy": -210}},
             {"type": "stop", "outcome": "completed"},
@@ -341,7 +418,10 @@ class AgentSmokeTest(LocalSite, unittest.IsolatedAsyncioTestCase):
 
         class TestModel:
             async def decide(self, request):
-                return ModelReply(json.dumps({**next(decisions), "reason": "Scroll inside the box."}))
+                decision = next(decisions)
+                if decision.get("action", {}).get("dy") == -210:
+                    await asyncio.sleep(REACTION_TIME_MS[1] / 1000 + 0.05)
+                return ModelReply(json.dumps({**decision, "reason": "Scroll inside the box."}))
 
         async def inspect_final(page):
             self.assertEqual(await page.evaluate("[scrollX, scrollY]"), [0, 0])
@@ -353,18 +433,35 @@ class AgentSmokeTest(LocalSite, unittest.IsolatedAsyncioTestCase):
             output = Path(directory) / "run"
             config = AgentConfig(target=self.url + "scroll-box", task="Scroll within the box.", record_input=True)
             result = await run_agent(config, TestModel(), output, inspect_final=inspect_final)
-            self.assertEqual((result.status, result.steps), ("completed", 3))
+            self.assertEqual((result.status, result.steps, result.model_calls), ("completed", 3, 5))
             actions = self.events(output)
             self.assertEqual(actions[0]["scroll_mode"], "smooth")
             scrolls = [event for event in actions if event.get("action", {}).get("type") == "scroll"]
             self.assertEqual([event["observation"]["title"] for event in scrolls], ["Scroll 260,430", "Scroll 140,220"])
             inputs = self.events(output, "inputs.jsonl")
+            agent_events = self.events(output, "agent.jsonl")
+            self.assertEqual(sum(event["event"] == "invalid_decision" for event in agent_events), 1)
+            reactions = [event for event in agent_events if event["event"] == "reaction_timing"]
+            self.assertEqual(len(reactions), 3)
+            self.assertTrue(all(REACTION_TIME_MS[0] <= event["target_ms"] <= REACTION_TIME_MS[1]
+                                and event["observation_to_action_ms"] >= event["target_ms"] for event in reactions))
+            self.assertGreater(reactions[0]["added_wait_ms"], 100)
+            self.assertEqual(reactions[-1]["added_wait_ms"], 0)
+            browser_actions = [event for event in actions if event["event"] == "action"]
+            for previous, current in pairwise(browser_actions):
+                observed_ms = datetime.fromisoformat(previous["timestamp"]).timestamp() * 1000
+                first_input = next(event for event in inputs if event.get("action_id") == current["action_id"]
+                                   and event["event"] == "input_command")
+                self.assertGreaterEqual(first_input["command_time_ms"] - observed_ms, REACTION_TIME_MS[0] - 5)
             for scroll in scrolls:
                 associated = [event for event in inputs if event.get("action_id") == scroll["action_id"]]
                 commands = [event for event in associated if event["event"] == "input_command"]
                 self.assertTrue(all(event["method"] == "mouse.wheel" for event in commands))
                 self.assertEqual(tuple(map(sum, zip(*(event["arguments"] for event in commands), strict=True))),
                                  (scroll["action"]["dx"], scroll["action"]["dy"]))
+                for previous, current in pairwise(commands):
+                    gap = (current["command_time_ms"] - previous["command_time_ms"]) / 1000
+                    self.assertLessEqual(hypot(*current["arguments"]), MAX_WHEEL_SPEED * gap * 1.05)
                 wheels = [event["input"] for event in associated if event["event"] == "input_event"
                           and event["input"]["type"] == "wheel"]
                 self.assertGreater(len(wheels), 8)
@@ -407,7 +504,11 @@ class AgentSmokeTest(LocalSite, unittest.IsolatedAsyncioTestCase):
             self.assertEqual(final["title"], "true: Trail")
             self.assertGreater(final["scroll"], 0)
             self.assertEqual(self.events(output)[0]["scroll_mode"], "swipe")
+            reactions = [row for row in self.events(output, "agent.jsonl") if row["event"] == "reaction_timing"]
+            self.assertEqual(len(reactions), 3)
+            self.assertTrue(all(row["observation_to_action_ms"] >= REACTION_TIME_MS[0] for row in reactions))
             events = self.events(output, "inputs.jsonl")
+            self.assert_typing_paced(events, reactions[0]["action_id"], "Trail", "touchscreen.tap", MOBILE_KEY_INTERVAL_MS[0])
             self.assertTrue(any(row.get("input", {}).get("type") == "touchmove"
                                 and row["input"]["trusted"] for row in events))
             self.assertFalse(any(row.get("method", "").startswith("mouse.") for row in events))
@@ -450,9 +551,8 @@ class AgentSmokeTest(LocalSite, unittest.IsolatedAsyncioTestCase):
             self.assertTrue(any(row["method"] == "keyboard.press" and row["arguments"] == ["Shift+KeyF"]
                                 and row["action_id"] == decision[0]["action_id"] for row in commands))
             self.assertFalse(any(row["method"] in {"keyboard.type", "keyboard.insert_text"} for row in commands))
-            self.assertEqual("".join(row["input"]["data"] or "" for row in delivered
-                                     if row["input"]["type"] == "input"
-                                     and row.get("decision_id") == decision[0]["decision_id"]), "Fern Creek")
+            self.assert_typing_paced(events, decision[0]["action_id"], "Fern Creek", "mouse.click",
+                                     DESKTOP_KEY_INTERVAL_MS[0])
             approach = [row["input"] for row in delivered if row["input"]["type"] == "pointermove"
                         and row.get("decision_id") == decision[0]["decision_id"]]
             self.assertGreaterEqual(len({row["x"] for row in approach}), 4)
@@ -471,6 +571,34 @@ class AgentSmokeTest(LocalSite, unittest.IsolatedAsyncioTestCase):
             manifest = json.loads((output / "recording.json").read_text(encoding="utf-8"))
             self.assertEqual(manifest["videos"][0]["page_id"], motion[-1]["page_id"])
             self.assertGreater((output / manifest["videos"][0]["path"]).stat().st_size, 0)
+
+    async def test_typing_budget_rejects_an_impossible_plan_and_allows_long_actions(self):
+        text = 'Fern Creek, route #123!'
+        decisions = iter([
+            {"type": "act", "action": {"type": "type", "x": 150, "y": 40, "text": "x" * 1000}},
+            {"type": "act", "action": {"type": "type", "x": 150, "y": 40, "text": text}},
+            {"type": "stop", "outcome": "completed"},
+        ])
+
+        class TestModel:
+            async def decide(self, request):
+                return ModelReply(json.dumps({**next(decisions), "reason": "Enter the whole query."}))
+
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "run"
+            config = AgentConfig(target=self.url + "search", task="Type the query.", timeout_seconds=25, record_input=True)
+            with patch("browser.worker.ACTION_TIMEOUT", 3):
+                result = await run_agent(config, TestModel(), output)
+            self.assertEqual((result.status, result.steps), ("completed", 2))
+            rejected, accepted = [row for row in self.events(output) if row.get("action", {}).get("type") == "type"]
+            self.assertEqual(rejected["status"], "rejected")
+            self.assertEqual(rejected["observation"]["title"], "Search fixture")
+            self.assertIn("remaining run time", rejected["observation"]["effect"]["rejected"])
+            events = self.events(output, "inputs.jsonl")
+            self.assertFalse(any(row.get("action_id") == rejected["action_id"] for row in events))
+            self.assertEqual((accepted["status"], accepted["observation"]["title"]), ("ok", "Query: " + text))
+            self.assertGreater(accepted["duration_ms"], 3000)
+            self.assert_typing_paced(events, accepted["action_id"], text, "mouse.click", DESKTOP_KEY_INTERVAL_MS[0])
 
     async def test_offscreen_link_is_neither_located_nor_dispatched_by_agent(self):
         requests = []

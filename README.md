@@ -238,10 +238,14 @@ The agent and scripted browser share the same virtual input devices. The model s
 
 - 桌面 Agent 在点击、悬停和聚焦输入框前移动到目标。`--pointer-mode continuous`（默认）使用直线缓动。`--pointer-mode cursory` 使用 [Cursory](https://github.com/Vinyzu/cursory) 根据真人记录生成带时间戳的轨迹，由 Playwright 在当前视口内执行。独立桌面浏览器脚本也支持这两种模式，它的默认值是 `--pointer-mode direct`。
 - The desktop agent moves to its target before clicking, hovering, or focusing a text field. `--pointer-mode continuous` (default) follows an eased straight line. `--pointer-mode cursory` uses [Cursory](https://github.com/Vinyzu/cursory) to generate a timed path based on recorded human motion, which Playwright executes within the current viewport. The standalone desktop browser runner also supports both modes and defaults to `--pointer-mode direct`.
-- 桌面 Agent 的一次滚动会在当前指针位置发送一串先加速、后减速的滚轮事件。每个方向的增量之和等于 Agent 请求的像素数，页面和可滚动容器按浏览器的规则响应。独立桌面浏览器脚本每次滚动发送单次滚轮事件。移动端通过触控滑动滚动。
-- One desktop agent scroll sends a series of wheel events at the current pointer position, accelerating and then easing to a stop. The deltas on each axis add up to the requested pixels. Pages and scrollable containers respond according to browser behavior. Scripted desktop browser runs send a single wheel event per scroll. Mobile runs scroll with touch swipes.
-- 独立浏览器脚本支持 `--text-input insert`（默认）与 `--text-input sequential`。Agent 固定使用逐键输入。
-- The standalone browser runner supports `--text-input insert` (default) and `--text-input sequential`. The agent always uses individual key presses.
+- 桌面 Agent 在当前指针位置发送先加速、后减速的滚轮事件。每段的速度有小幅变化，长距离滚动会分段并短暂停顿。双轴合成的滚轮输入速度上限是每秒 1,000 CSS 像素，每个轴单次最多请求 2,400 像素。接受的动作仍精确发送请求的总增量。独立桌面浏览器脚本每次发送单次滚轮事件，移动端通过触控滑动滚动。
+- The desktop agent sends wheel events at the current pointer position, accelerating and easing to a stop. Speed varies between strokes, and longer scrolls include short pauses between strokes. Combined wheel input across both axes is capped at 1,000 CSS pixels per second, with up to 2,400 pixels per axis in one action. The deltas of an accepted action still sum to the requested distance. Scripted desktop runs send a single wheel event per scroll, and mobile runs use touch swipes.
+- 独立浏览器脚本支持 `--text-input insert`（默认）与 `--text-input sequential`。Agent 聚焦输入框后按 450–700 毫秒的反应时间开始键盘操作，然后逐键输入。桌面键间隔为 160–250 毫秒，移动端为 195–275 毫秒，词与词之间会稍作停顿。如果剩余运行时间短于输入计划，Agent 会在输入前记录拒绝。较长输入的单步时限按计划用时延长，仍受 `--run-timeout` 限制。
+- The standalone browser runner supports `--text-input insert` (default) and `--text-input sequential`. The agent waits 450–700 milliseconds after focusing a field before using the keyboard, then types one character at a time. Key intervals are 160–250 milliseconds on desktop and 195–275 milliseconds on mobile, with a short extra pause between words. If the plan exceeds the remaining run time, the agent records a rejection before typing. Longer input gets a larger per-action budget based on the plan, subject to `--run-timeout`.
+
+桌面和移动端 Agent 都从新截图可用时开始为下一步计时。每步在 450–700 毫秒之间选一个最短反应时间，模型决策用时计入其中。只有未达到目标时才等待。`agent.jsonl` 的 `reaction_timing` 事件记录目标时长、截图到动作的实际间隔和补足的等待时间。
+
+Desktop and mobile agents time each action from when its screenshot is available. The minimum reaction time is sampled between 450 and 700 milliseconds per action, counting model decision time toward it. The agent waits for any remaining time. The `reaction_timing` event in `agent.jsonl` records the target, elapsed time from observation to action, and added wait.
 
 启动本地视觉模型后，可运行以下 Waymark 任务。基准测试独立核对结果，并保存 `inputs.jsonl` 和带指针的视频以便检查轨迹。
 

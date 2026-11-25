@@ -2,6 +2,8 @@ import asyncio
 from collections.abc import Awaitable, Callable
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
+from random import randint
+from time import perf_counter
 from typing import Literal
 from uuid import uuid4
 
@@ -9,7 +11,7 @@ from playwright.async_api import Error as BrowserError, Page
 from pydantic import BaseModel, ConfigDict, Field, HttpUrl, ValidationError, model_validator
 
 from browser.actions import MAX_STEPS, Click, Navigate, PointerAction, Scroll, Swipe, Tap, TypeText
-from browser.input_devices import ContinuousPointerMode, Device
+from browser.input_devices import REACTION_TIME_MS, ContinuousPointerMode, Device
 from browser.viewport import Viewport
 from browser.worker import RUN_TIMEOUT, BrowserWorker, PageObservation, browser_worker
 from logs import EventSink, RunEvents
@@ -31,6 +33,7 @@ from .model import (
 
 MODEL_TIMEOUT = 15
 MAX_RUN_TIMEOUT = 300
+MAX_SCROLL_AXIS = 2400
 
 
 class AgentConfig(BaseModel):
@@ -150,6 +153,10 @@ class _Run:
                             raise ValueError("Pointer coordinates must be inside the screenshot.")
                         if isinstance(action, Swipe) and (action.end_x >= width or action.end_y >= height):
                             raise ValueError("Swipe endpoint must be inside the screenshot.")
+                        if isinstance(action, Scroll) and max(abs(action.dx), abs(action.dy)) > MAX_SCROLL_AXIS:
+                            raise ValueError(
+                                f"Use multiple scrolls for long distances. Each axis allows up to {MAX_SCROLL_AXIS} pixels per action."
+                            )
                     elif request.mode == "explore" and decision.outcome == "completed" and decision.answer is None:
                         raise ValueError("Completed exploration requires a short summary of observations.")
                 except ValidationError as error:
@@ -190,6 +197,7 @@ class _Run:
         page = await worker.execute(Navigate(url=self.config.target))
         history: list[HistoryEntry] = []
         while True:
+            observed_at = perf_counter()
             remaining = self.config.max_steps - self.steps
             request = DecisionRequest(
                 task=self.config.task or "Explore the site's visible navigation and describe what you observed.",
@@ -206,6 +214,17 @@ class _Run:
                 return decision.outcome, decision.reason, decision.answer
             if remaining == 0:
                 return "step_limit", "The action budget was exhausted.", None
+            target_ms = randint(*REACTION_TIME_MS)
+            ready_at = observed_at + target_ms / 1000
+            wait_started = perf_counter()
+            while (delay := ready_at - perf_counter()) > 0:
+                await asyncio.sleep(delay)
+            ready = perf_counter()
+            added_wait_ms = round((ready - wait_started) * 1000, 1) if wait_started < ready_at else 0
+            self.record("reaction_timing", action_id=action_id, decision_id=decision_id,
+                        observation_id=page["observation_id"], target_ms=target_ms,
+                        observation_to_action_ms=round((ready - observed_at) * 1000, 1),
+                        added_wait_ms=added_wait_ms)
             self.steps += 1
             page = await worker.execute(
                 decision.action, action_id=action_id, decision_id=decision_id, recover_rejection=True,

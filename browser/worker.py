@@ -22,8 +22,8 @@ from .actions import (
     PressKey, Scroll, Swipe, Tap, TypeText, Wait,
 )
 from .input_devices import (
-    Device, Point, PointerMode, TextInputMode, VirtualKeyboard, VirtualMouse, VirtualTouchscreen,
-    cursory_trajectory, smooth_trajectory,
+    Device, Point, PointerMode, TextInputMode, TypingPlan, VirtualKeyboard, VirtualMouse, VirtualTouchscreen,
+    cursory_trajectory, plan_typing, smooth_trajectory,
 )
 from .recording import HIDE_RECORDING_POINTER, InputRecording
 from .viewport import Viewport
@@ -283,7 +283,11 @@ class BrowserWorker:
             self._recording.command(self._active_action, method, arguments, options)
         await dispatch(*arguments, **options)
 
-    async def _perform(self, action: Action) -> None:
+    def _check_typing_budget(self, planned_seconds: float) -> None:
+        if planned_seconds >= self._deadline - monotonic():
+            raise ActionRejected("The remaining run time cannot fit this text at the current typing pace.")
+
+    async def _perform(self, action: Action, typing: TypingPlan | None, typing_seconds: float) -> None:
         page = self._page
         if self._human_input and (isinstance(action, (Back, FindText))
                                   or isinstance(action, TypeText) and not isinstance(action, KeyText)):
@@ -323,21 +327,21 @@ class BrowserWorker:
                 await page.evaluate("() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)))")
             case Back():
                 await page.go_back(wait_until="domcontentloaded")
-            case TypeText(x=x, y=y, text=text) if self._touch:
-                if not await page.evaluate(_IS_EDITABLE, {"x": x, "y": y}):
-                    raise ActionRejected("Text entry requires a visible editable field.")
-                await self._touch.tap(x, y)
-                if not await page.evaluate(_IS_EDITABLE):
-                    raise ActionRejected("The field did not receive focus after tapping.")
-                await self._keyboard.press("ControlOrMeta+A")
-                if self._human_input:
-                    await self._keyboard.type_keys(text)
+            case TypeText(x=x, y=y, text=text) if self._touch or typing is not None:
+                if self._touch:
+                    if not await page.evaluate(_IS_EDITABLE, {"x": x, "y": y}):
+                        raise ActionRejected("Text entry requires a visible editable field.")
+                    await self._touch.tap(x, y)
+                    if not await page.evaluate(_IS_EDITABLE):
+                        raise ActionRejected("The field did not receive focus after tapping.")
                 else:
+                    await self._mouse.click(x, y)
+                if typing is not None:
+                    self._check_typing_budget(typing_seconds)
+                    await self._keyboard.type_keys(typing)
+                else:
+                    await self._keyboard.press("ControlOrMeta+A")
                     await self._keyboard.enter_text(text)
-            case KeyText(x=x, y=y, text=text) if self._human_input:
-                await self._mouse.click(x, y)
-                await self._keyboard.press("ControlOrMeta+A")
-                await self._keyboard.type_keys(text)
             case TypeText(x=x, y=y, text=text):
                 if not await page.evaluate(_IS_EDITABLE, {"x": x, "y": y}):
                     raise ActionRejected("Text entry requires an editable field at the supplied coordinates.")
@@ -399,7 +403,13 @@ class BrowserWorker:
                 remaining = self._deadline - started
                 if remaining <= 0:
                     raise TimeoutError("The browser run reached its time limit.")
-                async with asyncio.timeout(min(ACTION_TIMEOUT, remaining)):
+                typing = None
+                if self._human_input and isinstance(action, KeyText):
+                    typing = plan_typing(action.text, device="mobile" if self._touch else "desktop")
+                typing_seconds = sum(delay for _, delay in typing) if typing is not None else 0.0
+                # Allow time for browser acknowledgements in addition to the planned intervals.
+                action_timeout = ACTION_TIMEOUT + typing_seconds * 1.15
+                async with asyncio.timeout(min(action_timeout, remaining)):
                     if not isinstance(action, Navigate) and origin(self._page.url) != self._origin:
                         raise ValueError("Navigate to the target before interacting with the page.")
                     before_scroll = None
@@ -407,7 +417,9 @@ class BrowserWorker:
                         before_scroll = await self._page.evaluate("() => [scrollX, scrollY]")
                     rejection = None
                     try:
-                        await self._perform(action)
+                        if typing is not None:
+                            self._check_typing_budget(typing_seconds)
+                        await self._perform(action, typing, typing_seconds)
                     except ActionRejected as error:
                         if not recover_rejection:
                             raise ValueError(str(error)) from error
