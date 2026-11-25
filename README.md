@@ -156,6 +156,20 @@ The Agent defaults to `--mode task --device desktop`. Task mode requires a speci
 
 `--device mobile` enables Chromium's mobile layout and touch input. The Agent can tap, swipe, enter text after tapping to focus, and wait. Text is entered through browser keyboard events. Native phone keyboards and specific handset behavior require separate device verification. The viewport remains independently configurable, for example `--device mobile --viewport 390x844`. The scripted browser and benchmark entry points also accept `--device`; benchmarks verify their predefined task criteria.
 
+### 触控轨迹 / Touch trajectories
+
+移动运行支持 `--touch-motion linear`（默认）、`phoneos-flick`（加速后抬指）和 `phoneos-drag`（加速后减速）。后两项将 phoneos 滑动算法移植到 Python，以固定的起终点生成带时间的曲线采样点，再交给 Chromium 触控输入。使用 `--touch-seed` 可以复现同一配置下的手势序列，基准测试每次重复将种子加一。
+
+Mobile runs support `--touch-motion linear` (default), `phoneos-flick` (accelerate before lifting), and `phoneos-drag` (accelerate and decelerate). The latter two adapt phoneos's swipe algorithm to Python, generating timed curve samples between fixed endpoints and sending them through Chromium touch input. Use `--touch-seed` to reproduce a gesture sequence with the same configuration. The benchmark increments the seed for each repeat.
+
+```sh
+uv run --locked python -m tools.explorer_benchmark --group external --case iana-reserved --repeats 1 --device mobile --viewport 390x844 --touch-motion phoneos-flick --touch-seed 7 --record-input
+```
+
+移植参考 [phoneos 源码](https://github.com/mbatinefe/phoneos/blob/161910e11976ae88a3e6b000715a1694f3ce9794/src/humanize/humanizer.ts)，随项目附有 [Apache-2.0 许可证](licenses/phoneos-Apache-2.0.txt)。
+
+The port is based on the [phoneos source](https://github.com/mbatinefe/phoneos/blob/161910e11976ae88a3e6b000715a1694f3ce9794/src/humanize/humanizer.ts) and includes the [Apache-2.0 license](licenses/phoneos-Apache-2.0.txt).
+
 ## 单 Agent 自主探索 / Single-agent exploration
 
 也可以使用本地视觉模型，无需云端 API key。Hugging Face 权重下载、Windows CUDA 启动与 mock 实测复现步骤见 [本地模型说明](docs/local-model.md)。
@@ -236,12 +250,16 @@ Agent 和浏览器脚本共用虚拟输入设备。桌面模式使用虚拟鼠�
 
 The agent and scripted browser share virtual input devices. Desktop mode uses a virtual mouse and keyboard. Mobile mode uses a virtual touchscreen and keyboard. Mouse trajectory and wheel settings apply to desktop mode.
 
-- Agent 在点击、悬停和聚焦输入框前移动到目标。`--pointer-mode continuous`（默认）使用直线缓动。`--pointer-mode cursory` 使用 [Cursory](https://github.com/Vinyzu/cursory) 根据真人记录生成带时间戳的轨迹，由 Playwright 执行。独立浏览器脚本也支持这两种模式，它的默认值是 `--pointer-mode direct`。
-- The agent moves to its target before clicking, hovering, or focusing a text field. `--pointer-mode continuous` (default) follows an eased straight line. `--pointer-mode cursory` uses [Cursory](https://github.com/Vinyzu/cursory) to generate a timed path based on recorded human motion, which Playwright executes. The standalone browser runner also supports both modes and defaults to `--pointer-mode direct`.
-- Agent 的一次滚动会在当前指针位置发送一串先加速、后减速的滚轮事件。每个方向的增量之和等于 Agent 请求的像素数，页面和可滚动容器按浏览器的规则响应。独立浏览器脚本的滚动仍发送单次滚轮事件。
-- One agent scroll sends a series of wheel events at the current pointer position, accelerating and then easing to a stop. The deltas on each axis add up to the requested pixels. Pages and scrollable containers respond according to browser behavior. Scripted browser runs continue to send a single wheel event per scroll.
-- 独立浏览器脚本支持 `--text-input insert`（默认）与 `--text-input sequential`。Agent 固定使用逐键输入。
-- The standalone browser runner supports `--text-input insert` (default) and `--text-input sequential`. The agent always uses individual key presses.
+- 桌面 Agent 在点击、悬停和聚焦输入框前移动到目标。`--pointer-mode continuous`（默认）使用直线缓动。`--pointer-mode cursory` 使用 [Cursory](https://github.com/Vinyzu/cursory) 根据真人记录生成带时间戳的轨迹，由 Playwright 在当前视口内执行。独立桌面浏览器脚本也支持这两种模式，它的默认值是 `--pointer-mode direct`。
+- The desktop agent moves to its target before clicking, hovering, or focusing a text field. `--pointer-mode continuous` (default) follows an eased straight line. `--pointer-mode cursory` uses [Cursory](https://github.com/Vinyzu/cursory) to generate a timed path based on recorded human motion, which Playwright executes within the current viewport. The standalone desktop browser runner also supports both modes and defaults to `--pointer-mode direct`.
+- 桌面 Agent 在当前指针位置发送先加速、后减速的滚轮事件。每段的速度有小幅变化，长距离滚动会分段并短暂停顿。双轴合成的滚轮输入速度上限是每秒 1,000 CSS 像素，每个轴单次最多请求 2,400 像素。接受的动作仍精确发送请求的总增量。独立桌面浏览器脚本每次发送单次滚轮事件，移动端通过触控滑动滚动。
+- The desktop agent sends wheel events at the current pointer position, accelerating and easing to a stop. Speed varies between strokes, and longer scrolls include short pauses between strokes. Combined wheel input across both axes is capped at 1,000 CSS pixels per second, with up to 2,400 pixels per axis in one action. The deltas of an accepted action still sum to the requested distance. Scripted desktop runs send a single wheel event per scroll, and mobile runs use touch swipes.
+- 独立浏览器脚本支持 `--text-input insert`（默认）与 `--text-input sequential`。Agent 聚焦输入框后按 450–700 毫秒的反应时间开始键盘操作，然后逐键输入。桌面键间隔为 160–250 毫秒，移动端为 195–275 毫秒，词与词之间会稍作停顿。如果剩余运行时间短于输入计划，Agent 会在输入前记录拒绝。较长输入的单步时限按计划用时延长，仍受 `--run-timeout` 限制。
+- The standalone browser runner supports `--text-input insert` (default) and `--text-input sequential`. The agent waits 450–700 milliseconds after focusing a field before using the keyboard, then types one character at a time. Key intervals are 160–250 milliseconds on desktop and 195–275 milliseconds on mobile, with a short extra pause between words. If the plan exceeds the remaining run time, the agent records a rejection before typing. Longer input gets a larger per-action budget based on the plan, subject to `--run-timeout`.
+
+桌面和移动端 Agent 都从新截图可用时开始为下一步计时。每步在 450–700 毫秒之间选一个最短反应时间，模型决策用时计入其中。只有未达到目标时才等待。`agent.jsonl` 的 `reaction_timing` 事件记录目标时长、截图到动作的实际间隔和补足的等待时间。
+
+Desktop and mobile agents time each action from when its screenshot is available. The minimum reaction time is sampled between 450 and 700 milliseconds per action, counting model decision time toward it. The agent waits for any remaining time. The `reaction_timing` event in `agent.jsonl` records the target, elapsed time from observation to action, and added wait.
 
 启动本地视觉模型后，可运行以下 Waymark 任务。基准测试独立核对结果，并保存 `inputs.jsonl` 和带指针的视频以便检查轨迹。
 
@@ -257,6 +275,10 @@ uv run --locked python -m tools.explorer_benchmark --group mock --case parking -
 
 Add `--record-input` to `python -m agent`, `python -m browser`, or `python -m tools.explorer_benchmark` to capture the live browser run. The recorder works in both headless and headed Chromium. If Playwright's video runtime is missing, run `uv run --locked playwright install ffmpeg`.
 
+桌面录像显示鼠标箭头，移动录像用圆环标记手指触点，抬指后淡出。
+
+Desktop video shows a mouse arrow. Mobile video shows a ring at the touch contact, which fades after release.
+
 | 文件 / File | 内容 / Contents |
 | --- | --- |
 | `videos/*.webm` | Playwright 编码的页面视频。指针随浏览器产生的实际指针事件在录制时更新。 Playwright page video. The pointer overlay updates live from browser-generated pointer events. |
@@ -268,9 +290,9 @@ Add `--record-input` to `python -m agent`, `python -m browser`, or `python -m to
 
 Input events carry browser event time, page and frame IDs, and frame-local CSS-pixel coordinates. Coalesced samples are preserved when Chromium supplies them. Commands, browser actions, and model decisions are linked by run, action, and decision IDs. The recorder independently captures intermediate positions received by Chromium. The event log preserves detail between video frames. Model screenshots hide the recording pointer. The capture covers browser pages, including native input delivered to them.
 
-指针有实际位置后，在停顿和同一页面窗口内导航时会保留其最后位置，直到收到新的输入或指针离开视口。
+桌面指针有实际位置后，在停顿和同一页面窗口内导航时会保留其最后位置，直到收到新的输入或指针离开视口。
 
-Once the recorder has observed a pointer position, it retains that position during pauses and navigation in the same page window until new input arrives or the pointer leaves the viewport.
+Once the recorder has observed a desktop pointer position, it retains that position during pauses and navigation in the same page window until new input arrives or the pointer leaves the viewport.
 
 录制会保存实际输入的键和文字，请仅对可以保留此类输入的会话启用。
 

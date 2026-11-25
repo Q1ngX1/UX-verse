@@ -20,6 +20,7 @@ from playwright.async_api import Error as BrowserError, Page
 
 from agent.engine import AgentConfig, run_agent
 from browser.input_devices import ContinuousPointerMode
+from browser.touch_motion import add_touch_motion_arguments
 from browser.viewport import add_viewport_argument
 from logs import read_log
 from models.decision import FLAT_DECISIONS, DecisionAdapter
@@ -140,7 +141,8 @@ async def run(args: argparse.Namespace, mock_url: str, output: Path) -> None:
                     result = await run_agent(
                         AgentConfig(target=target, task=case.task, max_steps=args.steps, model_timeout_seconds=45,
                                     timeout_seconds=args.run_timeout, record_input=args.record_input,
-                                    pointer_mode=args.pointer_mode, viewport=args.viewport, device=args.device),
+                                    pointer_mode=args.pointer_mode, viewport=args.viewport, device=args.device,
+                                    touch_motion=args.touch_motion, touch_seed=args.touch_seed + repeat - 1),
                         model, run_dir, inspect_final=inspect_final,
                     )
                     answer = result.answer or result.reason
@@ -154,6 +156,7 @@ async def run(args: argparse.Namespace, mock_url: str, output: Path) -> None:
                 except (BrowserError, OSError, ValueError) as error:
                     record = {"passed": False, "error": str(error)}
                 row = {"repeat": repeat, "case": case.name, "group": "mock" if case in MOCK else "external",
+                       "touch_seed": args.touch_seed + repeat - 1,
                        "elapsed_seconds": round(monotonic() - started, 2), **record, "page": evidence,
                        "artifacts": run_dir.name}
                 records.append(row)
@@ -162,6 +165,7 @@ async def run(args: argparse.Namespace, mock_url: str, output: Path) -> None:
                     {"model": args.model, "steps": args.steps, "run_timeout": args.run_timeout,
                      "record_input": args.record_input, "pointer_mode": args.pointer_mode,
                      "viewport": args.viewport.model_dump(), "device": args.device,
+                     "touch_motion": args.touch_motion, "first_touch_seed": args.touch_seed,
                      "observation": "screenshot", "text_input": "keys", "runs": records},
                     ensure_ascii=False, indent=2,
                 ), encoding="utf-8")
@@ -180,6 +184,7 @@ def main() -> None:
     parser.add_argument("--model", default="qwen3-vl-8b-local")
     parser.add_argument("--base-url", default="http://127.0.0.1:8081/v1")
     add_viewport_argument(parser)
+    add_touch_motion_arguments(parser)
     args = parser.parse_args()
     if args.repeats < 1 or not 1 <= args.steps <= 29:
         parser.error("Repeats must be positive and steps must be between 1 and 29.")

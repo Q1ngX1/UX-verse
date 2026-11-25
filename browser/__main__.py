@@ -9,6 +9,7 @@ from playwright.async_api import Error
 
 from .actions import ACTION_LIST, Navigate
 from .input_devices import Device, PointerMode, TextInputMode
+from .touch_motion import TouchMotion, add_touch_motion_arguments
 from .viewport import Viewport, add_viewport_argument
 from .worker import browser_worker
 
@@ -17,11 +18,13 @@ async def run(
     target: Navigate, action_file: Path | None, output: Path, headed: bool, record_input: bool = False,
     *, pointer_mode: PointerMode = "direct", text_input: TextInputMode = "insert",
     viewport: Viewport = Viewport(), device: Device = "desktop",
+    touch_motion: TouchMotion = "linear", touch_seed: int = 0,
 ) -> None:
     actions = ACTION_LIST.validate_json(action_file.read_bytes()) if action_file else []
     async with browser_worker(
         target.url, output, headed=headed, record_input=record_input, pointer_mode=pointer_mode, text_input=text_input,
         viewport=viewport, device=device,
+        touch_motion=touch_motion, touch_seed=touch_seed,
     ) as worker:
         await worker.execute(target)
         for action in actions:
@@ -39,13 +42,14 @@ def main() -> None:
     parser.add_argument("--text-input", choices=("insert", "sequential"), default="insert")
     parser.add_argument("--device", choices=("desktop", "mobile"), default="desktop")
     add_viewport_argument(parser)
+    add_touch_motion_arguments(parser)
     args = parser.parse_args()
     run_id = f"{datetime.now(UTC):%Y%m%dT%H%M%S}-{uuid4().hex[:8]}"
     output = args.output or Path("runs", run_id)
     try:
         asyncio.run(run(Navigate(url=args.url), args.actions, output, args.headed, args.record_input,
                         pointer_mode=args.pointer_mode, text_input=args.text_input, viewport=args.viewport,
-                        device=args.device))
+                        device=args.device, touch_motion=args.touch_motion, touch_seed=args.touch_seed))
     except TimeoutError:
         parser.exit(1, f"Browser run timed out. Evidence directory: {output.resolve()}\n")
     except (Error, OSError, ValueError) as error:

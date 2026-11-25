@@ -16,11 +16,11 @@ POINTER_ATTRIBUTE = "data-uxverse-recording-pointer"
 HIDE_RECORDING_POINTER = f"[{POINTER_ATTRIBUTE}] {{ visibility: hidden !important; }}"
 
 _INSTALL = r"""
-({binding, token, attribute}) => {
+({binding, token, attribute, touchOverlay}) => {
     const publish = globalThis[binding].bind(globalThis);
     const documentId = crypto.randomUUID?.() ?? Math.random().toString(36).slice(2);
     let eventIndex = 0;
-    let marker, ring, ringTimer;
+    let marker, ring, ringTimer, touchTimer;
     let pointerUpdated = false;
 
     function showPointer(x, y, pressed = false) {
@@ -32,7 +32,13 @@ _INSTALL = r"""
             marker.style.cssText = 'all:initial;position:fixed;left:0;top:0;width:0;height:0;'
                 + 'z-index:2147483647;pointer-events:none!important;';
             const layer = marker.attachShadow({mode:'closed'});
-            layer.innerHTML = '<style>:host {pointer-events:none!important}'
+            layer.innerHTML = touchOverlay
+                ? '<style>svg {position:absolute;left:-15px;top:-15px;width:30px;height:30px}</style>'
+                    + '<svg viewBox="-15 -15 30 30" aria-hidden="true">'
+                    + '<circle r="12" fill="#123840" fill-opacity=".48" stroke="#12262e" stroke-width="3"/>'
+                    + '<circle r="11" fill="none" stroke="white" stroke-width="2"/>'
+                    + '<circle r="3" fill="#55e0db"/></svg>'
+                : '<style>:host {pointer-events:none!important}'
                 + 'svg {position:absolute;left:-9px;top:-9px;width:37px;height:37px;overflow:visible}'
                 + '</style><svg viewBox="-9 -9 37 37" aria-hidden="true">'
                 + '<circle r="8" fill="none" stroke="#ffba52" stroke-width="2" opacity="0"/>'
@@ -43,16 +49,28 @@ _INSTALL = r"""
         }
         marker.style.transform = 'translate(' + x + 'px,' + y + 'px)';
         marker.style.display = 'block';
-        if (pressed) {
+        if (touchOverlay) {
+            clearTimeout(touchTimer);
+            marker.style.transition = 'none';
+            marker.style.opacity = '1';
+        } else if (pressed) {
             ring.setAttribute('opacity', '1');
             clearTimeout(ringTimer);
             ringTimer = setTimeout(() => ring.setAttribute('opacity', '0'), 140);
         }
     }
 
+    function releaseTouch() {
+        if (!marker) return;
+        marker.style.transition = 'opacity 140ms ease-out';
+        marker.style.opacity = '0';
+        clearTimeout(touchTimer);
+        touchTimer = setTimeout(() => { marker.style.display = 'none'; }, 140);
+    }
+
     // Navigation replaces the overlay DOM, but the browser pointer stays in place.
     publish(token, null).then(position => {
-        if (!position) return;
+        if (touchOverlay || !position) return;
         const restore = () => {
             if (!pointerUpdated) showPointer(position.x, position.y);
         };
@@ -91,12 +109,12 @@ _INSTALL = r"""
                 if (name === 'wheel') Object.assign(payload, {
                     delta_x: event.deltaX, delta_y: event.deltaY, delta_z: event.deltaZ, delta_mode: event.deltaMode
                 });
-                if (event.isTrusted && (name === 'pointermove' || name === 'pointerrawupdate' ||
+                if (!touchOverlay && event.isTrusted && (name === 'pointermove' || name === 'pointerrawupdate' ||
                                         name === 'pointerdown' || name === 'wheel')) {
                     pointerUpdated = true;
                     showPointer(event.clientX, event.clientY, name === 'pointerdown');
                     payload.pointer_visible = true;
-                } else if (event.isTrusted && name === 'pointerout' &&
+                } else if (!touchOverlay && event.isTrusted && name === 'pointerout' &&
                            (event.relatedTarget?.localName === 'iframe' || event.clientX < 0 ||
                             event.clientX >= innerWidth || event.clientY < 0 || event.clientY >= innerHeight)) {
                     pointerUpdated = true;
@@ -109,13 +127,13 @@ _INSTALL = r"""
                     Object.assign(payload, {x: contact.clientX, y: contact.clientY,
                         screen_x: contact.screenX, screen_y: contact.screenY,
                         pointer_type: 'touch', touch_id: contact.identifier});
-                    if (event.isTrusted) {
+                    if (touchOverlay && event.isTrusted) {
                         pointerUpdated = true;
                         if (name === 'touchstart' || name === 'touchmove') {
                             showPointer(contact.clientX, contact.clientY, name === 'touchstart');
                             payload.pointer_visible = true;
                         } else {
-                            if (marker) marker.style.display = 'none';
+                            releaseTouch();
                             payload.pointer_visible = false;
                         }
                     }
@@ -145,9 +163,10 @@ def _wall_ms() -> float:
 class InputRecording:
     """Collect independently observed events with action and page identifiers."""
 
-    def __init__(self, output: Path, emit: EventSink) -> None:
+    def __init__(self, output: Path, emit: EventSink, *, touch_overlay: bool = False) -> None:
         self.output = output.resolve()
         self.emit = emit
+        self._touch_overlay = touch_overlay
         self._pages: dict[Page, str] = {}
         self._frames: dict[Frame, str] = {}
         self._pointer_positions: dict[Frame, tuple[float, dict[str, float] | None]] = {}
@@ -192,7 +211,8 @@ class InputRecording:
 
         context.on("page", page_opened)
         await context.expose_binding(binding, receive)
-        arguments = json.dumps({"binding": binding, "token": token, "attribute": POINTER_ATTRIBUTE})
+        arguments = json.dumps({"binding": binding, "token": token, "attribute": POINTER_ATTRIBUTE,
+                                "touchOverlay": self._touch_overlay})
         await context.add_init_script(script=f"({_INSTALL})({arguments})")
         self.emit("recording_started", clock="browser_epoch_ms", coordinates="frame_client_css_pixels")
 

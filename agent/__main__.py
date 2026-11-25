@@ -12,6 +12,7 @@ import httpx
 from playwright.async_api import Error as BrowserError
 
 from browser.input_devices import ContinuousPointerMode
+from browser.touch_motion import add_touch_motion_arguments
 from browser.viewport import add_viewport_argument
 from browser.worker import RUN_TIMEOUT
 from models.decision import FLAT_DECISIONS, DecisionAdapter
@@ -56,6 +57,7 @@ def main(argv: list[str] | None = None, *, api_key: str | None = None) -> int:
     parser.add_argument("--record-input", action="store_true", help="Record live page video, pointer and keyboard input")
     parser.add_argument("--pointer-mode", choices=get_args(ContinuousPointerMode), default="continuous")
     add_viewport_argument(parser)
+    add_touch_motion_arguments(parser)
     args = parser.parse_args(argv)
     if args.mode == "task" and args.task is None:
         parser.error("--task is required in task mode.")
@@ -73,6 +75,7 @@ def main(argv: list[str] | None = None, *, api_key: str | None = None) -> int:
             pointer_mode=args.pointer_mode,
             viewport=args.viewport,
             mode=args.mode, device=args.device,
+            touch_motion=args.touch_motion, touch_seed=args.touch_seed,
         )
         result = asyncio.run(_run(args, config, output, api_key))
     except (BrowserError, OSError, ValueError) as error:
