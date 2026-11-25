@@ -6,15 +6,16 @@ from typing import Literal
 from uuid import uuid4
 
 from playwright.async_api import Error as BrowserError, Page
-from pydantic import BaseModel, ConfigDict, Field, HttpUrl, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, HttpUrl, ValidationError, model_validator
 
-from browser.actions import MAX_STEPS, Click, Navigate, PointerAction, Scroll, TypeText
-from browser.input_devices import ContinuousPointerMode
-from browser.worker import RUN_TIMEOUT, VIEWPORT, BrowserWorker, PageObservation, browser_worker
+from browser.actions import MAX_STEPS, Click, Navigate, PointerAction, Scroll, Swipe, Tap, TypeText
+from browser.input_devices import ContinuousPointerMode, Device
+from browser.viewport import Viewport
+from browser.worker import RUN_TIMEOUT, BrowserWorker, PageObservation, browser_worker
 from logs import EventSink, RunEvents
 
 from .model import (
-    DECISION,
+    DEVICE_DECISIONS,
     Act,
     Decision,
     DecisionRequest,
@@ -22,6 +23,7 @@ from .model import (
     HistoryEntry,
     ModelError,
     ModelReply,
+    Mode,
     Observation,
     RetryableModelError,
     Stop,
@@ -35,13 +37,22 @@ class AgentConfig(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, str_strip_whitespace=True)
 
     target: HttpUrl
-    task: str = Field(min_length=1, max_length=2000)
+    task: str | None = Field(default=None, min_length=1, max_length=2000)
     persona: str | None = Field(default=None, min_length=1, max_length=1000)
     max_steps: int = Field(default=12, ge=1, lt=MAX_STEPS, strict=True)
     timeout_seconds: float = Field(default=RUN_TIMEOUT, gt=0, le=MAX_RUN_TIMEOUT)
     model_timeout_seconds: float = Field(default=MODEL_TIMEOUT, gt=0, le=MAX_RUN_TIMEOUT)
     record_input: bool = False
+    viewport: Viewport = Viewport()
     pointer_mode: ContinuousPointerMode = "continuous"
+    mode: Mode = "task"
+    device: Device = "desktop"
+
+    @model_validator(mode="after")
+    def require_task_for_task_mode(self) -> "AgentConfig":
+        if self.mode == "task" and self.task is None:
+            raise ValueError("Task mode requires a task.")
+        return self
 
 
 Status = Literal["completed", "gave_up", "stalled", "step_limit", "model_error", "browser_error", "timeout"]
@@ -79,6 +90,8 @@ def _repetition_feedback(decision: Decision, request: DecisionRequest) -> str | 
     if unchanged and isinstance(action, Scroll) and action == previous.action == latest.action:
         return ("The last two identical scrolls left the screenshot unchanged. Try a different control or direction: "
                 "use positive dy to reveal content farther down, negative dy to return toward the top.")
+    if unchanged and isinstance(action, (Tap, Swipe)) and action == previous.action == latest.action:
+        return "The last two identical gestures had no visible effect. Try a different control or gesture."
     return None
 
 
@@ -129,11 +142,16 @@ class _Run:
                 if reply.model_id is not None:
                     fields["model_id"] = reply.model_id
                 try:
-                    decision = DECISION.validate_json(reply.decision_json)
-                    if isinstance(decision, Act) and isinstance(decision.action, PointerAction):
-                        pointer = decision.action
-                        if pointer.x >= request.observation.width or pointer.y >= request.observation.height:
+                    decision = DEVICE_DECISIONS[request.device].validate_json(reply.decision_json)
+                    if isinstance(decision, Act):
+                        action = decision.action
+                        width, height = request.observation.width, request.observation.height
+                        if isinstance(action, PointerAction) and (action.x >= width or action.y >= height):
                             raise ValueError("Pointer coordinates must be inside the screenshot.")
+                        if isinstance(action, Swipe) and (action.end_x >= width or action.end_y >= height):
+                            raise ValueError("Swipe endpoint must be inside the screenshot.")
+                    elif request.mode == "explore" and decision.outcome == "completed" and decision.answer is None:
+                        raise ValueError("Completed exploration requires a short summary of observations.")
                 except ValidationError as error:
                     issues = [
                         {"location": item["loc"], "type": item["type"]}
@@ -145,7 +163,7 @@ class _Run:
                     )
                 except ValueError as error:
                     self.record("invalid_decision", **fields, error=type(error).__name__, usage=usage)
-                    feedback = "Return a decision matching the schema, with any pointer inside the screenshot."
+                    feedback = str(error)
                 else:
                     repeated = _repetition_feedback(decision, request)
                     if repeated:
@@ -164,8 +182,8 @@ class _Run:
     def observe(self, page: PageObservation) -> Observation:
         return Observation(
             screenshot_png=(self.output / page["screenshot"]).read_bytes(),
-            width=VIEWPORT["width"],
-            height=VIEWPORT["height"],
+            width=page["viewport"]["width"],
+            height=page["viewport"]["height"],
         )
 
     async def explore(self, worker: BrowserWorker) -> tuple[Status, str, str | None]:
@@ -174,11 +192,13 @@ class _Run:
         while True:
             remaining = self.config.max_steps - self.steps
             request = DecisionRequest(
-                task=self.config.task,
+                task=self.config.task or "Explore the site's visible navigation and describe what you observed.",
                 persona=self.config.persona,
                 observation=self.observe(page),
                 history=tuple(history),
                 steps_remaining=remaining,
+                mode=self.config.mode,
+                device=self.config.device,
             )
             decision_id, action_id = uuid4().hex, uuid4().hex
             decision = await self.decide(request, page, decision_id=decision_id, action_id=action_id)
@@ -207,7 +227,7 @@ async def run_agent(
     async with browser_worker(
         config.target, output, headed=headed, events=events, inspect_final=inspect_final,
         timeout_seconds=config.timeout_seconds, record_input=config.record_input,
-        pointer_mode=config.pointer_mode, human_input=True,
+        pointer_mode=config.pointer_mode, human_input=True, viewport=config.viewport, device=config.device,
     ) as worker:
         with events.open_log(output / "agent.jsonl", source="agent") as emit:
             run = _Run(config, model, output, emit)

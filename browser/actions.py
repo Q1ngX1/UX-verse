@@ -25,6 +25,16 @@ class Hover(PointerAction):
     type: Literal["hover"] = "hover"
 
 
+class Tap(PointerAction):
+    type: Literal["tap"] = "tap"
+
+
+class Swipe(PointerAction):
+    type: Literal["swipe"] = "swipe"
+    end_x: Annotated[int, Field(ge=0)]
+    end_y: Annotated[int, Field(ge=0)]
+
+
 class Scroll(BrowserAction):
     type: Literal["scroll"] = "scroll"
     dx: int = 0
@@ -63,7 +73,8 @@ class Wait(BrowserAction):
 
 
 Action = Annotated[
-    Navigate | Click | Hover | Scroll | TypeText | Back | PressKey | FindText | Wait, Field(discriminator="type"),
+    Navigate | Click | Hover | Tap | Swipe | Scroll | TypeText | Back | PressKey | FindText | Wait,
+    Field(discriminator="type"),
 ]
 MAX_STEPS = 30
 ACTION_LIST = TypeAdapter(Annotated[list[Action], Field(max_length=MAX_STEPS - 1)])

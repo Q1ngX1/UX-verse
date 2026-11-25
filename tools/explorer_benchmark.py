@@ -20,9 +20,9 @@ from playwright.async_api import Error as BrowserError, Page
 
 from agent.engine import AgentConfig, run_agent
 from browser.input_devices import ContinuousPointerMode
-from browser.worker import VIEWPORT
+from browser.viewport import add_viewport_argument
 from logs import read_log
-from models.decision import DecisionAdapter, FlatDecision
+from models.decision import FLAT_DECISIONS, DecisionAdapter
 from models.local import LocalProvider
 
 
@@ -83,10 +83,13 @@ async def inspect(page: Page, case: Case) -> dict[str, bool | str]:
     # The content check below confirms the section even if a visit reached it by scrolling.
     nodes = page.locator(case.selector).filter(has_text=case.evidence)
     evidence_visible = False
+    viewport = page.viewport_size
+    if viewport is None:
+        raise ValueError("Benchmark inspection requires a fixed page viewport.")
     for node in await nodes.all():
         box = await node.bounding_box(timeout=1500)
-        if (box and box["y"] >= 0 and box["y"] + box["height"] <= VIEWPORT["height"]
-                and box["x"] >= 0 and box["x"] + box["width"] <= VIEWPORT["width"]):
+        if (box and box["y"] >= 0 and box["y"] + box["height"] <= viewport["height"]
+                and box["x"] >= 0 and box["x"] + box["width"] <= viewport["width"]):
             evidence_visible = await node.is_visible()
             if evidence_visible:
                 break
@@ -121,7 +124,7 @@ async def run(args: argparse.Namespace, mock_url: str, output: Path) -> None:
     records = []
     async with httpx.AsyncClient(timeout=45, trust_env=False) as client:
         provider = LocalProvider(client, base_url=args.base_url, max_output_tokens=512,
-                                 response_schema=FlatDecision.model_json_schema())
+                                 response_schema=FLAT_DECISIONS[args.device].model_json_schema())
         model = DecisionAdapter(provider, args.model, flat_output=True)
         for repeat in range(1, args.repeats + 1):
             for case in selected:
@@ -137,7 +140,7 @@ async def run(args: argparse.Namespace, mock_url: str, output: Path) -> None:
                     result = await run_agent(
                         AgentConfig(target=target, task=case.task, max_steps=args.steps, model_timeout_seconds=45,
                                     timeout_seconds=args.run_timeout, record_input=args.record_input,
-                                    pointer_mode=args.pointer_mode),
+                                    pointer_mode=args.pointer_mode, viewport=args.viewport, device=args.device),
                         model, run_dir, inspect_final=inspect_final,
                     )
                     answer = result.answer or result.reason
@@ -158,6 +161,7 @@ async def run(args: argparse.Namespace, mock_url: str, output: Path) -> None:
                 (output / "report.json").write_text(json.dumps(
                     {"model": args.model, "steps": args.steps, "run_timeout": args.run_timeout,
                      "record_input": args.record_input, "pointer_mode": args.pointer_mode,
+                     "viewport": args.viewport.model_dump(), "device": args.device,
                      "observation": "screenshot", "text_input": "keys", "runs": records},
                     ensure_ascii=False, indent=2,
                 ), encoding="utf-8")
@@ -172,8 +176,10 @@ def main() -> None:
     parser.add_argument("--run-timeout", type=float, default=180)
     parser.add_argument("--record-input", action="store_true", help="Record live browser video and input events")
     parser.add_argument("--pointer-mode", choices=get_args(ContinuousPointerMode), default="continuous")
+    parser.add_argument("--device", choices=("desktop", "mobile"), default="desktop")
     parser.add_argument("--model", default="qwen3-vl-8b-local")
     parser.add_argument("--base-url", default="http://127.0.0.1:8081/v1")
+    add_viewport_argument(parser)
     args = parser.parse_args()
     if args.repeats < 1 or not 1 <= args.steps <= 29:
         parser.error("Repeats must be positive and steps must be between 1 and 29.")

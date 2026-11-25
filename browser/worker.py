@@ -1,8 +1,7 @@
 import asyncio
 import re
-from collections.abc import AsyncIterator, Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterable
 from contextlib import asynccontextmanager, nullcontext
-from functools import partial
 from hashlib import sha256
 from pathlib import Path
 from time import monotonic
@@ -10,17 +9,25 @@ from typing import NotRequired, TypedDict
 from urllib.parse import urlsplit
 from uuid import uuid4
 
-from playwright.async_api import ConsoleMessage, Error, Locator, Page, Response, Route, WebSocketRoute, async_playwright
+from playwright.async_api import (
+    CDPSession, ConsoleMessage, Error, Locator, Page, Response, Route, WebSocketRoute, async_playwright,
+)
 from playwright.async_api import TimeoutError as PlaywrightTimeout
 from pydantic import HttpUrl
 
 from logs import EventSink, RunEvents
 
-from .actions import MAX_STEPS, Action, Back, Click, FindText, Hover, KeyText, Navigate, PressKey, Scroll, TypeText, Wait
-from .input_devices import PointerMode, TextInputMode, VirtualKeyboard, VirtualMouse, cursory_trajectory, smooth_trajectory
+from .actions import (
+    MAX_STEPS, Action, Back, Click, FindText, Hover, KeyText, Navigate, PointerAction,
+    PressKey, Scroll, Swipe, Tap, TypeText, Wait,
+)
+from .input_devices import (
+    Device, Point, PointerMode, TextInputMode, VirtualKeyboard, VirtualMouse, VirtualTouchscreen,
+    cursory_trajectory, smooth_trajectory,
+)
 from .recording import HIDE_RECORDING_POINTER, InputRecording
+from .viewport import Viewport
 
-VIEWPORT = {"width": 1280, "height": 720}
 ACTION_TIMEOUT = 10
 RUN_TIMEOUT = 90
 CLICK_NAVIGATION_TIMEOUT_MS = 250
@@ -50,6 +57,7 @@ class PageObservation(TypedDict):
     url: str
     title: str
     screenshot: str
+    viewport: dict[str, int]
     effect: NotRequired[ActionEffect]
     controls: NotRequired[list[ControlHint]]
     visible_text: NotRequired[list[str]]
@@ -135,7 +143,7 @@ class BrowserWorker:
         self, page: Page, target: HttpUrl, output: Path, emit: EventSink, *, control_hints: bool = False,
         timeout_seconds: float = RUN_TIMEOUT, text_hints: bool = False, recording: InputRecording | None = None,
         pointer_mode: PointerMode = "direct", text_input: TextInputMode = "insert",
-        human_input: bool = False,
+        human_input: bool = False, touch_session: CDPSession | None = None,
     ) -> None:
         self._page = page
         self._origin = origin(str(target))
@@ -145,6 +153,9 @@ class BrowserWorker:
         self._text_hints = text_hints
         self._recording = recording
         self._human_input = human_input
+        self._touch = (
+            VirtualTouchscreen(page.touchscreen, touch_session, self._dispatch_input) if touch_session else None
+        )
         self._step = 0
         self._lock = asyncio.Lock()
         self._deadline = monotonic() + timeout_seconds
@@ -154,7 +165,7 @@ class BrowserWorker:
         self._active_action: dict[str, str] = {}
         trajectory = {
             "continuous": smooth_trajectory,
-            "cursory": partial(cursory_trajectory, viewport=(VIEWPORT["width"], VIEWPORT["height"])),
+            "cursory": self._cursory_path,
         }.get(pointer_mode)
         self._mouse = VirtualMouse(page.mouse, self._dispatch_input, trajectory, smooth_scroll=human_input)
         self._keyboard = VirtualKeyboard(page.keyboard, self._dispatch_input, text_input)
@@ -204,7 +215,18 @@ class BrowserWorker:
         if origin(url) != self._origin:
             return False
         box = await links.bounding_box(timeout=1000)
-        return bool(box and (box["y"] >= VIEWPORT["height"] or box["y"] + box["height"] <= 0))
+        return bool(box and (box["y"] >= self.viewport["height"] or box["y"] + box["height"] <= 0))
+
+    @property
+    def viewport(self) -> dict[str, int]:
+        size = self._page.viewport_size
+        if size is None:
+            raise ValueError("The browser worker requires a fixed page viewport.")
+        return {"width": size["width"], "height": size["height"]}
+
+    def _cursory_path(self, start: Point, target: Point) -> Iterable[tuple[Point, float]]:
+        viewport = self.viewport
+        return cursory_trajectory(start, target, viewport=(viewport["width"], viewport["height"]))
 
     async def _observe(
         self, step: int, *, action: Action, before_url: str, before_scroll: list[int] | None,
@@ -222,6 +244,7 @@ class BrowserWorker:
         path.write_bytes(image)
         observation: PageObservation = {
             "observation_id": uuid4().hex, "url": url, "title": title, "screenshot": screenshot,
+            "viewport": self.viewport,
         }
         digest = sha256(image).digest()
         if self._last_visual_hash is not None:
@@ -265,8 +288,15 @@ class BrowserWorker:
         if self._human_input and (isinstance(action, (Back, FindText))
                                   or isinstance(action, TypeText) and not isinstance(action, KeyText)):
             raise ValueError("This action is unavailable to the human-input runner.")
-        if isinstance(action, (Click, Hover, TypeText)) and (action.x >= VIEWPORT["width"] or action.y >= VIEWPORT["height"]):
+        viewport = self.viewport
+        if isinstance(action, PointerAction) and (action.x >= viewport["width"] or action.y >= viewport["height"]):
             raise ValueError("Pointer coordinates are outside the viewport.")
+        if isinstance(action, Swipe) and (action.end_x >= viewport["width"] or action.end_y >= viewport["height"]):
+            raise ValueError("Swipe endpoint is outside the viewport.")
+        if self._touch and isinstance(action, (Click, Hover, Scroll, PressKey)):
+            raise ActionRejected("Use touch gestures in mobile mode.")
+        if not self._touch and isinstance(action, (Tap, Swipe)):
+            raise ActionRejected("Touch gestures require mobile mode.")
         match action:
             case Navigate(url=url):
                 if url.username is not None or origin(str(url)) != self._origin:
@@ -284,8 +314,26 @@ class BrowserWorker:
                 await page.evaluate("""() => new Promise(resolve => {
                     requestAnimationFrame(() => requestAnimationFrame(() => resolve()));
                 })""")
+            case Tap(x=x, y=y) if self._touch:
+                before_url = page.url
+                await self._touch.tap(x, y)
+                await self._wait_for_navigation(before_url)
+            case Swipe(x=x, y=y, end_x=end_x, end_y=end_y) if self._touch:
+                await self._touch.swipe((x, y), (end_x, end_y))
+                await page.evaluate("() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)))")
             case Back():
                 await page.go_back(wait_until="domcontentloaded")
+            case TypeText(x=x, y=y, text=text) if self._touch:
+                if not await page.evaluate(_IS_EDITABLE, {"x": x, "y": y}):
+                    raise ActionRejected("Text entry requires a visible editable field.")
+                await self._touch.tap(x, y)
+                if not await page.evaluate(_IS_EDITABLE):
+                    raise ActionRejected("The field did not receive focus after tapping.")
+                await self._keyboard.press("ControlOrMeta+A")
+                if self._human_input:
+                    await self._keyboard.type_keys(text)
+                else:
+                    await self._keyboard.enter_text(text)
             case KeyText(x=x, y=y, text=text) if self._human_input:
                 await self._mouse.click(x, y)
                 await self._keyboard.press("ControlOrMeta+A")
@@ -395,7 +443,7 @@ async def browser_worker(
     control_hints: bool = False, inspect_final: Callable[[Page], Awaitable[None]] | None = None,
     timeout_seconds: float = RUN_TIMEOUT, text_hints: bool = False, record_input: bool = False,
     pointer_mode: PointerMode = "direct", text_input: TextInputMode = "insert",
-    human_input: bool = False,
+    human_input: bool = False, viewport: Viewport = Viewport(), device: Device = "desktop",
 ) -> AsyncIterator[BrowserWorker]:
     if target.username is not None:
         raise ValueError("The target URL must not contain credentials.")
@@ -409,19 +457,28 @@ async def browser_worker(
         async with async_playwright() as playwright:
             browser = await playwright.chromium.launch(headless=not headed)
             try:
+                # Playwright's video encoder requires even frame dimensions.
+                video_size = {
+                    "width": viewport.width + viewport.width % 2,
+                    "height": viewport.height + viewport.height % 2,
+                }
                 context = await browser.new_context(
-                    viewport=VIEWPORT, accept_downloads=False, service_workers="block",
+                    viewport={"width": viewport.width, "height": viewport.height},
+                    is_mobile=device == "mobile", has_touch=device == "mobile",
+                    accept_downloads=False, service_workers="block",
                     record_video_dir=output / "videos" if recording else None,
-                    record_video_size=VIEWPORT if recording else None,
+                    record_video_size=video_size if recording else None,
                 )
                 if recording:
                     await recording.install(context)
                 page = await context.new_page()
+                touch_session = await context.new_cdp_session(page) if device == "mobile" else None
                 worker = BrowserWorker(
                     page, target, output, emit, control_hints=control_hints,
                     timeout_seconds=timeout_seconds, text_hints=text_hints,
                     recording=recording,
                     pointer_mode=pointer_mode, text_input=text_input, human_input=human_input,
+                    touch_session=touch_session,
                 )
                 page.on("console", worker._console_message)
                 page.on("pageerror", lambda error: worker._record("page_error", url=page.url, message=str(error)))
@@ -432,8 +489,11 @@ async def browser_worker(
                 await context.route("**/*", worker._route)
                 await context.route_web_socket("**/*", worker._close_socket)
                 await context.tracing.start(screenshots=True, snapshots=True)
-                worker._record("run_started", target=str(target), viewport=VIEWPORT,
-                               pointer_mode=pointer_mode, scroll_mode="smooth" if human_input else "direct",
+                scroll_mode = "smooth" if human_input else "direct"
+                if device == "mobile":
+                    scroll_mode = "swipe"
+                worker._record("run_started", target=str(target), viewport=worker.viewport, device=device,
+                               pointer_mode=pointer_mode, scroll_mode=scroll_mode,
                                text_input="keys" if human_input else text_input,
                                human_input=human_input)
                 try:

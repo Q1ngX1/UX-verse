@@ -7,8 +7,9 @@ from math import ceil, hypot
 from time import perf_counter
 from typing import Literal
 
-from playwright.async_api import Keyboard, Mouse
+from playwright.async_api import CDPSession, Keyboard, Mouse, Touchscreen
 
+Device = Literal["desktop", "mobile"]
 ContinuousPointerMode = Literal["continuous", "cursory"]
 PointerMode = Literal["direct", ContinuousPointerMode]
 TextInputMode = Literal["insert", "sequential"]
@@ -116,6 +117,29 @@ class VirtualMouse:
         async for (step_x, step_y) in _pace(smooth_wheel_steps(dx, dy)):
             if step_x or step_y:
                 await self._dispatch("mouse.wheel", self._backend.wheel, step_x, step_y)
+
+
+class VirtualTouchscreen:
+    def __init__(self, backend: Touchscreen, session: CDPSession, dispatch: Dispatch) -> None:
+        self._backend = backend
+        self._session = session
+        self._dispatch = dispatch
+
+    async def tap(self, x: int, y: int) -> None:
+        await self._dispatch("touchscreen.tap", self._backend.tap, x, y)
+
+    async def _touch(self, event: str, points: list[dict[str, int]]) -> None:
+        await self._dispatch("Input.dispatchTouchEvent", self._session.send, "Input.dispatchTouchEvent",
+                             {"type": event, "touchPoints": points})
+
+    async def swipe(self, start: Point, end: Point) -> None:
+        await self._touch("touchStart", [{"x": start[0], "y": start[1]}])
+        try:
+            for (x, y), delay in smooth_trajectory(start, end):
+                await asyncio.sleep(delay)
+                await self._touch("touchMove", [{"x": x, "y": y}])
+        finally:
+            await self._touch("touchEnd", [])
 
 
 class VirtualKeyboard:

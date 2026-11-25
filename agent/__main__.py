@@ -12,8 +12,9 @@ import httpx
 from playwright.async_api import Error as BrowserError
 
 from browser.input_devices import ContinuousPointerMode
+from browser.viewport import add_viewport_argument
 from browser.worker import RUN_TIMEOUT
-from models.decision import DecisionAdapter, FlatDecision
+from models.decision import FLAT_DECISIONS, DecisionAdapter
 from models.local import LocalProvider
 from models.responses import ResponsesProvider
 
@@ -22,7 +23,7 @@ from .engine import AgentConfig, AgentResult, run_agent
 
 async def _run(args: argparse.Namespace, config: AgentConfig, output: Path, api_key: str | None) -> AgentResult:
     async with httpx.AsyncClient(timeout=config.model_timeout_seconds, trust_env=args.provider != "local") as client:
-        schema = FlatDecision.model_json_schema() if args.structured_output else None
+        schema = FLAT_DECISIONS[config.device].model_json_schema() if args.structured_output else None
         if args.provider == "local":
             provider = LocalProvider(
                 client, base_url=args.base_url, max_output_tokens=args.max_output_tokens, response_schema=schema,
@@ -38,7 +39,9 @@ async def _run(args: argparse.Namespace, config: AgentConfig, output: Path, api_
 def main(argv: list[str] | None = None, *, api_key: str | None = None) -> int:
     parser = argparse.ArgumentParser(description="Run a vision-based UX-verse Explorer.")
     parser.add_argument("url", help="Start page on the target origin")
-    parser.add_argument("--task", required=True, help="Task for the Explorer")
+    parser.add_argument("--task", help="Required task in task mode, optional brief in explore mode")
+    parser.add_argument("--mode", choices=("task", "explore"), default="task")
+    parser.add_argument("--device", choices=("desktop", "mobile"), default="desktop")
     parser.add_argument("--provider", choices=("openrouter", "openai", "local"), default="openrouter")
     parser.add_argument("--base-url", default="http://127.0.0.1:8081/v1", help="Local model's loopback /v1 URL")
     parser.add_argument("--model", default=os.getenv("UX_VERSE_DECISION_MODEL"), help="Vision model ID")
@@ -52,7 +55,10 @@ def main(argv: list[str] | None = None, *, api_key: str | None = None) -> int:
     parser.add_argument("--headed", action="store_true", help="Show the Chromium window")
     parser.add_argument("--record-input", action="store_true", help="Record live page video, pointer and keyboard input")
     parser.add_argument("--pointer-mode", choices=get_args(ContinuousPointerMode), default="continuous")
+    add_viewport_argument(parser)
     args = parser.parse_args(argv)
+    if args.mode == "task" and args.task is None:
+        parser.error("--task is required in task mode.")
     if not args.model or not args.model.strip():
         parser.error("Provide --model or set UX_VERSE_DECISION_MODEL.")
 
@@ -65,6 +71,8 @@ def main(argv: list[str] | None = None, *, api_key: str | None = None) -> int:
             model_timeout_seconds=args.model_timeout,
             record_input=args.record_input,
             pointer_mode=args.pointer_mode,
+            viewport=args.viewport,
+            mode=args.mode, device=args.device,
         )
         result = asyncio.run(_run(args, config, output, api_key))
     except (BrowserError, OSError, ValueError) as error:

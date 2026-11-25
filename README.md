@@ -128,6 +128,34 @@ Worker 面向本地或其他受信且已授权的站点。同源请求过滤和�
 
 Use the worker on local or other trusted, authorized sites. Same-origin request filtering and an independent browser session scope each run. Testing untrusted sites requires separate network isolation in the runtime environment.
 
+### 运行视口 / Run viewport
+
+`python -m browser`、`python -m agent` 和 `python -m tools.explorer_benchmark` 都接受 `--viewport WIDTHxHEIGHT`，单位为 CSS 像素，默认 `1280x720`。Python 调用可在 `AgentConfig` 中设置 `viewport={"width": 1440, "height": 900}`，或向 `browser_worker` 传入 `browser.viewport.Viewport` 实例。运行日志保存初始宽高，每张截图的观测保存对应视口，录制视频使用初始视口作为输出画布。
+
+`python -m browser`, `python -m agent`, and `python -m tools.explorer_benchmark` accept `--viewport WIDTHxHEIGHT` in CSS pixels, defaulting to `1280x720`. Python callers can set `viewport={"width": 1440, "height": 900}` in `AgentConfig` or pass a `browser.viewport.Viewport` instance to `browser_worker`. Run logs record the initial dimensions, each screenshot observation records its viewport, and video recording uses the initial viewport as its output canvas.
+
+```sh
+uv run --locked python -m tools.explorer_benchmark --group external --case iana-reserved --repeats 1 --record-input --viewport 390x844
+```
+
+窄视口可测试响应式排版。完整手机设备模拟还需要配置触控、移动设备模式和像素倍率；一次运行使用一个初始尺寸。
+
+A narrow viewport can test responsive layout. Full phone emulation also requires touch, mobile mode, and device pixel ratio settings. Each run uses one initial size.
+
+如果视口宽或高为奇数，对应的视频画布边长向上取整到偶数，网页和截图仍使用原始视口尺寸。
+
+Odd viewport dimensions round up to the next even pixel for the video canvas. The page and screenshots retain the original viewport dimensions.
+
+### 探索模式和设备 / Exploration mode and device
+
+Agent 默认使用 `--mode task --device desktop`。任务模式要求 `--task` 提供明确目标。自由探索使用 `--mode explore`，此时 `--task` 可用于限定探索范围，完成时返回观察摘要。Python 调用可设置 `AgentConfig` 的 `mode` 和 `device` 字段。
+
+The Agent defaults to `--mode task --device desktop`. Task mode requires a specific goal in `--task`. For open exploration, use `--mode explore`; an optional `--task` provides an exploration brief, and completion returns a summary of observations. Python callers can set the `mode` and `device` fields of `AgentConfig`.
+
+`--device mobile` 启用 Chromium 移动布局和触控。Agent 可用轻点、滑动、在轻点聚焦后输入文字以及等待。输入文字使用浏览器键盘事件，原生手机软键盘和具体机型由独立的设备验证覆盖。视口仍可独立指定，例如 `--device mobile --viewport 390x844`。脚本浏览器和基准测试入口也接受 `--device`，基准测试按预设任务的验收条件检查结果。
+
+`--device mobile` enables Chromium's mobile layout and touch input. The Agent can tap, swipe, enter text after tapping to focus, and wait. Text is entered through browser keyboard events. Native phone keyboards and specific handset behavior require separate device verification. The viewport remains independently configurable, for example `--device mobile --viewport 390x844`. The scripted browser and benchmark entry points also accept `--device`; benchmarks verify their predefined task criteria.
+
 ## 单 Agent 自主探索 / Single-agent exploration
 
 也可以使用本地视觉模型，无需云端 API key。Hugging Face 权重下载、Windows CUDA 启动与 mock 实测复现步骤见 [本地模型说明](docs/local-model.md)。
@@ -208,10 +236,10 @@ Agent 和浏览器脚本共用同一套虚拟输入设备。模型仍选择点�
 
 The agent and scripted browser share the same virtual input devices. The model still chooses a click, hover, scroll, key press, or text action. The virtual mouse tracks its current coordinates, and the virtual keyboard handles key chords and text entry.
 
-- Agent 在点击、悬停和聚焦输入框前移动到目标。`--pointer-mode continuous`（默认）使用直线缓动。`--pointer-mode cursory` 使用 [Cursory](https://github.com/Vinyzu/cursory) 根据真人记录生成带时间戳的轨迹，由 Playwright 执行。独立浏览器脚本也支持这两种模式，它的默认值是 `--pointer-mode direct`。
-- The agent moves to its target before clicking, hovering, or focusing a text field. `--pointer-mode continuous` (default) follows an eased straight line. `--pointer-mode cursory` uses [Cursory](https://github.com/Vinyzu/cursory) to generate a timed path based on recorded human motion, which Playwright executes. The standalone browser runner also supports both modes and defaults to `--pointer-mode direct`.
-- Agent 的一次滚动会在当前指针位置发送一串先加速、后减速的滚轮事件。每个方向的增量之和等于 Agent 请求的像素数，页面和可滚动容器按浏览器的规则响应。独立浏览器脚本的滚动仍发送单次滚轮事件。
-- One agent scroll sends a series of wheel events at the current pointer position, accelerating and then easing to a stop. The deltas on each axis add up to the requested pixels. Pages and scrollable containers respond according to browser behavior. Scripted browser runs continue to send a single wheel event per scroll.
+- 桌面 Agent 在点击、悬停和聚焦输入框前移动到目标。`--pointer-mode continuous`（默认）使用直线缓动。`--pointer-mode cursory` 使用 [Cursory](https://github.com/Vinyzu/cursory) 根据真人记录生成带时间戳的轨迹，由 Playwright 在当前视口内执行。独立桌面浏览器脚本也支持这两种模式，它的默认值是 `--pointer-mode direct`。
+- The desktop agent moves to its target before clicking, hovering, or focusing a text field. `--pointer-mode continuous` (default) follows an eased straight line. `--pointer-mode cursory` uses [Cursory](https://github.com/Vinyzu/cursory) to generate a timed path based on recorded human motion, which Playwright executes within the current viewport. The standalone desktop browser runner also supports both modes and defaults to `--pointer-mode direct`.
+- 桌面 Agent 的一次滚动会在当前指针位置发送一串先加速、后减速的滚轮事件。每个方向的增量之和等于 Agent 请求的像素数，页面和可滚动容器按浏览器的规则响应。独立桌面浏览器脚本每次滚动发送单次滚轮事件。移动端通过触控滑动滚动。
+- One desktop agent scroll sends a series of wheel events at the current pointer position, accelerating and then easing to a stop. The deltas on each axis add up to the requested pixels. Pages and scrollable containers respond according to browser behavior. Scripted desktop browser runs send a single wheel event per scroll. Mobile runs scroll with touch swipes.
 - 独立浏览器脚本支持 `--text-input insert`（默认）与 `--text-input sequential`。Agent 固定使用逐键输入。
 - The standalone browser runner supports `--text-input insert` (default) and `--text-input sequential`. The agent always uses individual key presses.
 
