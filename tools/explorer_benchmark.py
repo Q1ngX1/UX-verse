@@ -11,6 +11,7 @@ from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from threading import Thread
 from time import monotonic
+from typing import get_args
 from urllib.parse import urlparse
 from uuid import uuid4
 
@@ -18,6 +19,7 @@ import httpx
 from playwright.async_api import Error as BrowserError, Page
 
 from agent.engine import AgentConfig, run_agent
+from browser.input_devices import ContinuousPointerMode
 from browser.viewport import add_viewport_argument
 from logs import read_log
 from models.decision import FLAT_DECISIONS, DecisionAdapter
@@ -173,7 +175,7 @@ def main() -> None:
     parser.add_argument("--steps", type=int, default=10)
     parser.add_argument("--run-timeout", type=float, default=180)
     parser.add_argument("--record-input", action="store_true", help="Record live browser video and input events")
-    parser.add_argument("--pointer-mode", choices=("continuous",), default="continuous")
+    parser.add_argument("--pointer-mode", choices=get_args(ContinuousPointerMode), default="continuous")
     parser.add_argument("--device", choices=("desktop", "mobile"), default="desktop")
     parser.add_argument("--model", default="qwen3-vl-8b-local")
     parser.add_argument("--base-url", default="http://127.0.0.1:8081/v1")

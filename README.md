@@ -232,14 +232,24 @@ uv run --locked python -m tools.explorer_benchmark --repeats 2
 
 ### 虚拟鼠标与键盘 / Virtual mouse and keyboard
 
-Agent 和浏览器脚本共用同一套虚拟输入设备。模型仍选择点击、悬停、滚动、按键或输入文字。虚拟鼠标维护当前坐标，虚拟键盘负责组合键和文字输入。
+Agent 和浏览器脚本共用虚拟输入设备。桌面模式使用虚拟鼠标和键盘，移动模式使用虚拟触控屏和键盘。鼠标轨迹和滚轮配置适用于桌面模式。
 
-The agent and scripted browser share the same virtual input devices. The model still chooses a click, hover, scroll, key press, or text action. The virtual mouse tracks its current coordinates, and the virtual keyboard handles key chords and text entry.
+The agent and scripted browser share virtual input devices. Desktop mode uses a virtual mouse and keyboard. Mobile mode uses a virtual touchscreen and keyboard. Mouse trajectory and wheel settings apply to desktop mode.
 
-- Agent 在点击、悬停和聚焦输入框之前，通过带时间间隔的中间位置移动到目标。独立浏览器脚本可通过 `--pointer-mode direct`（默认）或 `--pointer-mode continuous` 选择移动方式。
-- The agent traverses timed intermediate positions before clicking, hovering, or focusing a text field. The standalone browser runner offers `--pointer-mode direct` (default) and `--pointer-mode continuous`.
+- Agent 在点击、悬停和聚焦输入框前移动到目标。`--pointer-mode continuous`（默认）使用直线缓动。`--pointer-mode cursory` 使用 [Cursory](https://github.com/Vinyzu/cursory) 根据真人记录生成带时间戳的轨迹，由 Playwright 执行。独立浏览器脚本也支持这两种模式，它的默认值是 `--pointer-mode direct`。
+- The agent moves to its target before clicking, hovering, or focusing a text field. `--pointer-mode continuous` (default) follows an eased straight line. `--pointer-mode cursory` uses [Cursory](https://github.com/Vinyzu/cursory) to generate a timed path based on recorded human motion, which Playwright executes. The standalone browser runner also supports both modes and defaults to `--pointer-mode direct`.
+- Agent 的一次滚动会在当前指针位置发送一串先加速、后减速的滚轮事件。每个方向的增量之和等于 Agent 请求的像素数，页面和可滚动容器按浏览器的规则响应。独立浏览器脚本的滚动仍发送单次滚轮事件。
+- One agent scroll sends a series of wheel events at the current pointer position, accelerating and then easing to a stop. The deltas on each axis add up to the requested pixels. Pages and scrollable containers respond according to browser behavior. Scripted browser runs continue to send a single wheel event per scroll.
 - 独立浏览器脚本支持 `--text-input insert`（默认）与 `--text-input sequential`。Agent 固定使用逐键输入。
 - The standalone browser runner supports `--text-input insert` (default) and `--text-input sequential`. The agent always uses individual key presses.
+
+启动本地视觉模型后，可运行以下 Waymark 任务。基准测试独立核对结果，并保存 `inputs.jsonl` 和带指针的视频以便检查轨迹。
+
+With the local vision model running, use the following Waymark task. The benchmark independently checks the result and saves `inputs.jsonl` and a video with the pointer for trajectory inspection.
+
+```sh
+uv run --locked python -m tools.explorer_benchmark --group mock --case parking --repeats 1 --pointer-mode cursory --record-input
+```
 
 ### 实跑视频与输入录制 / Live video and input recording
 
@@ -254,9 +264,9 @@ Add `--record-input` to `python -m agent`, `python -m browser`, or `python -m to
 | `inputs.jsonl` | 下发命令和浏览器收到的指针、点击、滚轮、按键、文字插入及组合输入事件。 Dispatch commands and observed pointer, click, wheel, key, text input, and composition events. |
 | `recording.json` | 录制状态、页面 ID 与视频轨道路径。 Recording status, page IDs, and video track paths. |
 
-输入事件携带浏览器事件时间、页面与 frame ID，以及 frame 内 CSS 像素坐标。浏览器提供合并采样时，也会保存这些中间点。命令、浏览器动作和模型决定通过运行 ID、动作 ID 与决策 ID 关联。未来的连续移动模块只要向 Chromium 下发真实输入事件，中间轨迹就会被独立采集。视频按帧采样，验证细节时可查事件日志。模型截图会隐藏录制指针。采集范围是浏览器页面，包含在页面中收到的系统输入。
+输入事件携带浏览器事件时间、页面与 frame ID，以及 frame 内 CSS 像素坐标。浏览器提供合并采样时，也会保存这些中间点。命令、浏览器动作和模型决定通过运行 ID、动作 ID 与决策 ID 关联。录制器独立采集 Chromium 实际收到的中间位置。视频按帧采样，验证细节时可查事件日志。模型截图会隐藏录制指针。采集范围是浏览器页面，包含在页面中收到的系统输入。
 
-Input events carry browser event time, page and frame IDs, and frame-local CSS-pixel coordinates. Coalesced samples are preserved when Chromium supplies them. Commands, browser actions, and model decisions are linked by run, action, and decision IDs. A future continuous movement backend can supply real Chromium input events and the recorder will observe those intermediate positions independently. The event log preserves detail between video frames. Model screenshots hide the recording pointer. The capture covers browser pages, including native input delivered to them.
+Input events carry browser event time, page and frame IDs, and frame-local CSS-pixel coordinates. Coalesced samples are preserved when Chromium supplies them. Commands, browser actions, and model decisions are linked by run, action, and decision IDs. The recorder independently captures intermediate positions received by Chromium. The event log preserves detail between video frames. Model screenshots hide the recording pointer. The capture covers browser pages, including native input delivered to them.
 
 指针有实际位置后，在停顿和同一页面窗口内导航时会保留其最后位置，直到收到新的输入或指针离开视口。
 

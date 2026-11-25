@@ -2,6 +2,7 @@ import asyncio
 import re
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager, nullcontext
+from functools import partial
 from hashlib import sha256
 from pathlib import Path
 from time import monotonic
@@ -21,7 +22,10 @@ from .actions import (
     MAX_STEPS, Action, Back, Click, FindText, Hover, KeyText, Navigate, PointerAction,
     PressKey, Scroll, Swipe, Tap, TypeText, Wait,
 )
-from .input_devices import Device, PointerMode, TextInputMode, VirtualKeyboard, VirtualMouse, VirtualTouchscreen, smooth_trajectory
+from .input_devices import (
+    Device, PointerMode, TextInputMode, VirtualKeyboard, VirtualMouse, VirtualTouchscreen,
+    cursory_trajectory, smooth_trajectory,
+)
 from .recording import HIDE_RECORDING_POINTER, InputRecording
 from .viewport import Viewport
 
@@ -160,8 +164,14 @@ class BrowserWorker:
         self._last_visual_hash: bytes | None = None
         self._previous_visual_hash: bytes | None = None
         self._active_action: dict[str, str] = {}
-        self._mouse = VirtualMouse(page.mouse, self._dispatch_input,
-                                   smooth_trajectory if pointer_mode == "continuous" else None)
+        trajectory = None
+        if pointer_mode == "continuous":
+            trajectory = smooth_trajectory
+        elif pointer_mode == "cursory":
+            viewport = self.viewport
+            trajectory = partial(cursory_trajectory, viewport=(viewport["width"], viewport["height"]))
+        self._mouse = VirtualMouse(page.mouse, self._dispatch_input, trajectory,
+                                   smooth_scroll=human_input and touch_session is None)
         self._keyboard = VirtualKeyboard(page.keyboard, self._dispatch_input, text_input)
 
     def _record(self, event: str, **fields: object) -> None:
@@ -437,7 +447,7 @@ async def browser_worker(
 ) -> AsyncIterator[BrowserWorker]:
     if target.username is not None:
         raise ValueError("The target URL must not contain credentials.")
-    if human_input and (control_hints or text_hints or pointer_mode != "continuous"):
+    if human_input and (control_hints or text_hints or pointer_mode == "direct"):
         raise ValueError("The human-input runner requires continuous pointer motion and screenshot-only observation.")
     output.mkdir(parents=True, exist_ok=False)
     run_events = events if events is not None else RunEvents()
@@ -479,8 +489,10 @@ async def browser_worker(
                 await context.route("**/*", worker._route)
                 await context.route_web_socket("**/*", worker._close_socket)
                 await context.tracing.start(screenshots=True, snapshots=True)
+                scroll_mode = "touch" if touch_session else "smooth" if human_input else "direct"
                 worker._record("run_started", target=str(target), viewport=worker.viewport, device=device,
-                               pointer_mode=pointer_mode, text_input="keys" if human_input else text_input,
+                               pointer_mode=pointer_mode, scroll_mode=scroll_mode,
+                               text_input="keys" if human_input else text_input,
                                human_input=human_input)
                 try:
                     yield worker

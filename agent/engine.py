@@ -9,7 +9,7 @@ from playwright.async_api import Error as BrowserError, Page
 from pydantic import BaseModel, ConfigDict, Field, HttpUrl, ValidationError, model_validator
 
 from browser.actions import MAX_STEPS, Click, Navigate, PointerAction, Scroll, Swipe, Tap, TypeText
-from browser.input_devices import Device
+from browser.input_devices import ContinuousPointerMode, Device
 from browser.viewport import Viewport
 from browser.worker import RUN_TIMEOUT, BrowserWorker, PageObservation, browser_worker
 from logs import EventSink, RunEvents
@@ -44,7 +44,7 @@ class AgentConfig(BaseModel):
     model_timeout_seconds: float = Field(default=MODEL_TIMEOUT, gt=0, le=MAX_RUN_TIMEOUT)
     record_input: bool = False
     viewport: Viewport = Viewport()
-    pointer_mode: Literal["continuous"] = "continuous"
+    pointer_mode: ContinuousPointerMode = "continuous"
     mode: Mode = "task"
     device: Device = "desktop"
 
