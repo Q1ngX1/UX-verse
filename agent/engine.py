@@ -10,11 +10,11 @@ from uuid import uuid4
 from playwright.async_api import Error as BrowserError, Page
 from pydantic import BaseModel, ConfigDict, Field, HttpUrl, ValidationError, model_validator
 
-from browser.actions import MAX_STEPS, Click, Navigate, PointerAction, Scroll, Swipe, Tap, TypeText
+from browser.actions import MAX_STEPS, CenterReading, Click, Navigate, PointerAction, Scroll, Swipe, Tap, TypeText
 from browser.input_devices import REACTION_TIME_MS, ContinuousPointerMode, Device
 from browser.touch_motion import TouchMotion
 from browser.viewport import Viewport
-from browser.worker import RUN_TIMEOUT, BrowserWorker, PageObservation, browser_worker
+from browser.worker import RUN_TIMEOUT, ActionEffect, BrowserWorker, PageObservation, browser_worker
 from logs import EventSink, RunEvents
 
 from .model import (
@@ -35,6 +35,9 @@ from .model import (
 MODEL_TIMEOUT = 15
 MAX_RUN_TIMEOUT = 300
 MAX_SCROLL_AXIS = 2400
+THOUGHT_TIME_MS = (750, 1100)
+READING_THRESHOLD_WORDS = 48
+MAX_READING_TIME_MS = 10_000
 
 
 class AgentConfig(BaseModel):
@@ -78,10 +81,15 @@ class NoProgress(Exception):
 
 
 def _repetition_feedback(decision: Decision, request: DecisionRequest) -> str | None:
-    if not isinstance(decision, Act) or len(request.history) < 2 or request.steps_remaining == 0:
+    if not isinstance(decision, Act) or not request.history or request.steps_remaining == 0:
         return None
-    previous, latest = request.history[-2:]
     action = decision.action
+    latest = request.history[-1]
+    if isinstance(action, CenterReading) and isinstance(latest.action, CenterReading):
+        return "The reading position was already adjusted once. Read from the current screenshot or choose another action."
+    if len(request.history) < 2:
+        return None
+    previous = request.history[-2]
     unchanged = not (previous.visual_change or latest.visual_change)
     if (isinstance(action, TypeText) and action == previous.action == latest.action
             and not latest.visual_change):
@@ -99,6 +107,40 @@ def _repetition_feedback(decision: Decision, request: DecisionRequest) -> str | 
     if unchanged and isinstance(action, (Tap, Swipe)) and action == previous.action == latest.action:
         return "The last two identical gestures had no visible effect. Try a different control or gesture."
     return None
+
+
+def _position_before_answer(decision: Decision, request: DecisionRequest) -> Decision:
+    if (not isinstance(decision, Stop) or decision.outcome != "completed" or not decision.answer
+            or decision.reading_point is None or request.steps_remaining == 0
+            or (request.history and isinstance(request.history[-1].action, CenterReading))):
+        return decision
+    point = decision.reading_point
+    width, height = request.observation.width, request.observation.height
+    if point.x >= width or point.y >= height:
+        raise ValueError("The reading point must be inside the screenshot.")
+    action = CenterReading(x=point.x, y=point.y)
+    if not action.vertical_offset(height):
+        return decision
+    return Act(type="act", reason="Position the answer's source before reading.", action=action)
+
+
+def _position_after_edge_activation(
+    decision: Decision, request: DecisionRequest, effect: ActionEffect | None,
+) -> Act | None:
+    if (not isinstance(decision, Act) or not isinstance(decision.action, (Click, Tap))
+            or not request.history or not request.steps_remaining or effect is None or effect["url_changed"]):
+        return None
+    latest = request.history[-1]
+    previous = latest.action
+    action = decision.action
+    height = request.observation.height
+    if (not isinstance(previous, (Click, Tap)) or previous.type != action.type
+            or not latest.visual_change or latest.visual_cycle or previous.y < height * 0.85
+            or abs(previous.x - action.x) > 12 or abs(previous.y - action.y) > 12):
+        return None
+    # The first activation changed the view. Bring the area just below it into view before activating it again.
+    point = CenterReading(x=previous.x, y=min(height - 1, previous.y + round(height * 0.05)))
+    return Act(type="act", reason="Inspect the changed area below the last activation.", action=point)
 
 
 class _Run:
@@ -149,6 +191,7 @@ class _Run:
                     fields["model_id"] = reply.model_id
                 try:
                     decision = DEVICE_DECISIONS[request.device].validate_json(reply.decision_json)
+                    decision = _position_before_answer(decision, request)
                     if isinstance(decision, Act):
                         action = decision.action
                         width, height = request.observation.width, request.observation.height
@@ -175,6 +218,11 @@ class _Run:
                     self.record("invalid_decision", **fields, error=type(error).__name__, usage=usage)
                     feedback = str(error)
                 else:
+                    adjustment = _position_after_edge_activation(decision, request, page.get("effect"))
+                    if adjustment is not None:
+                        self.record("action_adjusted", **fields, action_id=action_id,
+                                    proposed=decision.model_dump(mode="json"), adjusted=adjustment.model_dump(mode="json"))
+                        decision = adjustment
                     repeated = _repetition_feedback(decision, request)
                     if repeated:
                         self.record("repeated_action", **fields, decision=decision.model_dump(mode="json"), usage=usage)
@@ -199,6 +247,8 @@ class _Run:
     async def explore(self, worker: BrowserWorker) -> tuple[Status, str, str | None]:
         page = await worker.execute(Navigate(url=self.config.target))
         history: list[HistoryEntry] = []
+        read_views: set[tuple[str, str]] = set()
+        refreshed_after_idle = False
         while True:
             observed_at = perf_counter()
             remaining = self.config.max_steps - self.steps
@@ -213,17 +263,46 @@ class _Run:
             )
             decision_id, action_id = uuid4().hex, uuid4().hex
             decision = await self.decide(request, page, decision_id=decision_id, action_id=action_id)
-            if isinstance(decision, Stop):
-                return decision.outcome, decision.reason, decision.answer
-            if remaining == 0:
+            if isinstance(decision, Act) and remaining == 0:
                 return "step_limit", "The action budget was exhausted.", None
-            target_ms = randint(*REACTION_TIME_MS)
-            ready_at = observed_at + target_ms / 1000
+
+            reading = page.get("reading")
+            read_words = 0
+            adjusting = isinstance(decision, Act) and isinstance(decision.action, CenterReading)
+            if not adjusting and reading is not None and reading["words"] >= READING_THRESHOLD_WORDS:
+                key = (page["url"], reading["key"])
+                if key not in read_views:
+                    read_words = reading["words"]
+                    read_views.add(key)
+            target_ms = randint(*REACTION_TIME_MS) if isinstance(decision, Act) else 0
+            thought_ms = randint(*THOUGHT_TIME_MS) if isinstance(decision, Act) else 0
+            # Simulate scanning a portion of the visible prose, with a budget for long pages.
+            reading_ms = 0
+            if read_words:
+                reading_ms = min(MAX_READING_TIME_MS, round(read_words * 0.30 * 60_000 / randint(210, 260)))
+            attention_ms = max(target_ms, thought_ms, reading_ms)
+            ready_at = observed_at + attention_ms / 1000
             wait_started = perf_counter()
-            while (delay := ready_at - perf_counter()) > 0:
-                await asyncio.sleep(delay)
+            moved, refreshed = False, None
+            if (delay := ready_at - wait_started) > 0:
+                moved, refreshed = await worker.idle(
+                    delay, page=page, decision_id=decision_id, reading=bool(read_words),
+                    wander=bool(read_words) and not refreshed_after_idle,
+                )
             ready = perf_counter()
             added_wait_ms = round((ready - wait_started) * 1000, 1) if wait_started < ready_at else 0
+            if attention_ms:
+                self.record("attention_timing", decision_id=decision_id, observation_id=page["observation_id"],
+                            activity="reading" if read_words else "thinking", visible_words=read_words,
+                            target_ms=attention_ms, added_wait_ms=added_wait_ms, idle_mouse_moved=moved)
+            if refreshed is not None:
+                self.record("decision_superseded", decision_id=decision_id, observation_id=page["observation_id"],
+                            next_observation_id=refreshed["observation_id"])
+                page = refreshed
+                refreshed_after_idle = True
+                continue
+            if isinstance(decision, Stop):
+                return decision.outcome, decision.reason, decision.answer
             self.record("reaction_timing", action_id=action_id, decision_id=decision_id,
                         observation_id=page["observation_id"], target_ms=target_ms,
                         observation_to_action_ms=round((ready - observed_at) * 1000, 1),
@@ -232,6 +311,7 @@ class _Run:
             page = await worker.execute(
                 decision.action, action_id=action_id, decision_id=decision_id, recover_rejection=True,
             )
+            refreshed_after_idle = False
             effect = page.get("effect")
             history.append(HistoryEntry(
                 decision.action,

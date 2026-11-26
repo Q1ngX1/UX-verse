@@ -18,7 +18,7 @@ from unittest.mock import patch
 
 import httpx
 
-from agent.engine import MAX_SCROLL_AXIS, REACTION_TIME_MS, AgentConfig, run_agent
+from agent.engine import MAX_SCROLL_AXIS, REACTION_TIME_MS, THOUGHT_TIME_MS, AgentConfig, run_agent
 from agent.model import DECISION, DecisionRequest, ModelReply, ModelUsage, RetryableModelError
 from browser.actions import Click
 from browser.input_devices import (
@@ -71,6 +71,19 @@ class TestSite(BaseHTTPRequestHandler):
                 <style>body{margin:0;min-height:1600px} summary{height:48px}</style>
                 <details><summary>Show answer</summary><p>Answer inside.</p></details>
                 <a style="position:absolute;top:1400px" href="/next">Offscreen link</a>'''
+        elif self.path == "/disclosure-edge":
+            body = '''<!doctype html><meta name="viewport" content="width=device-width, initial-scale=1">
+                <title>Clipped disclosure fixture</title>
+                <style>
+                    body {margin:0; font:16px/22px system-ui}
+                    main {box-sizing:border-box; min-height:165vh; padding:90vh 20px 0}
+                    summary {height:38px}
+                    p {margin:0; max-width:360px}
+                </style>
+                <main><details><summary>Show answer</summary>
+                    <p>Follow the old tracks to the clearing. The lookout is just beyond the footbridge.
+                    Bring water and allow more time after rain. The gate beside the lookout opens at seven.</p>
+                </details></main>'''
         elif self.path == "/scroll-box":
             body = '''<!doctype html><title>Scroll 0,0</title>
                 <style>
@@ -86,6 +99,42 @@ class TestSite(BaseHTTPRequestHandler):
                         document.title = 'Scroll ' + box.scrollLeft + ',' + box.scrollTop;
                     });
                 </script>'''
+        elif self.path == "/reading-center":
+            body = '''<!doctype html><meta name="viewport" content="width=device-width, initial-scale=1">
+                <title>Fern Creek Visitor Guide</title>
+                <style>
+                    body { margin:0; background:#f1f4ec; color:#182c23; font:16px/1.45 system-ui }
+                    main { width:min(calc(100% - 40px), 640px); margin:auto; min-height:150vh }
+                    header { box-sizing:border-box; height:71vh; padding-top:9vh }
+                    h1 { font-size:clamp(30px, 5vw, 58px); line-height:1.05; margin:14px 0 }
+                    article { background:white; border-left:4px solid #427257; padding:12px 16px }
+                    h2 { font-size:21px; margin:0 0 6px }
+                    p { margin:0 }
+                </style>
+                <main>
+                  <header><small>FERN CREEK RESERVE</small><h1>Visitor Guide</h1></header>
+                  <article><h2>North entrance gate</h2>
+                    <p>The north entrance gate opens at 7:15 a.m. every morning. Read the visitor board next
+                    to the gate for updates on creek crossings and the condition of the trail. Continue straight
+                    to reach the picnic area, or follow the green markers to the overlook. Pack water and allow
+                    extra time when the ground is wet.</p>
+                  </article>
+                </main>'''
+        elif self.path in {"/reading", "/reading-change"}:
+            paragraph = (
+                "The visitor guide describes the trails from the north entrance and explains how to reach the picnic "
+                "area after arriving. The gate opens at seven every morning. The guide also gives directions to "
+                "the overlook, explains what to bring, and lists the trail names and the facilities near each entrance."
+            )
+            body = f'''<!doctype html><meta name="viewport" content="width=device-width, initial-scale=1">
+                <title>Visitor guide</title>
+                <style>body {{ margin:0 }} main {{ min-height:100vh; padding:48px; box-sizing:border-box }}
+                p {{ max-width:640px }} #note {{ height:40px }}</style>
+                <main><p>{paragraph}</p><p hidden>{paragraph * 10}</p><div id="note"></div></main>'''
+            if self.path == "/reading-change":
+                body += """<script>document.addEventListener('pointermove', () => {
+                    document.getElementById('note').textContent = 'New note';
+                }, {once:true});</script>"""
         elif self.path == "/next":
             body = '<title>Loading next page</title><h1></h1><script defer src="/next.js"></script>'
         elif self.path == "/next.js":
@@ -404,6 +453,112 @@ class BrowserSmokeTest(LocalSite, unittest.TestCase):
 
 
 class AgentSmokeTest(LocalSite, unittest.IsolatedAsyncioTestCase):
+    async def test_reading_target_is_positioned_before_reading_on_desktop_and_mobile(self):
+        for device, width, height in (("desktop", 1280, 720), ("mobile", 390, 844)):
+            with self.subTest(device=device), tempfile.TemporaryDirectory() as directory:
+                views = []
+
+                class TestModel:
+                    async def decide(self, request):
+                        views.append(request.observation.screenshot_png)
+                        if device == "desktop":
+                            return ModelReply(json.dumps({
+                                "type": "stop", "outcome": "completed", "reason": "Read the guide.", "answer": "7:15 a.m.",
+                                "reading_point": {"x": width // 2, "y": round(height * 0.81)},
+                            }))
+                        if request.retry_feedback:
+                            return ModelReply('{"type":"stop","outcome":"completed","reason":"Read the guide.",'
+                                              '"answer":"7:15 a.m."}')
+                        # Try positioning again to verify that only one adjustment is dispatched.
+                        return ModelReply(json.dumps({"type": "act", "reason": "Position the guide text.", "action": {
+                            "type": "center_reading", "x": width // 2, "y": round(height * 0.81),
+                        }}))
+
+                async def inspect_final(page):
+                    bounds = await page.locator("article p").bounding_box()
+                    self.assertGreater(await page.evaluate("scrollY"), height * 0.15)
+                    self.assertAlmostEqual(bounds["y"] + bounds["height"] / 2, height / 2, delta=height * 0.15)
+
+                output = Path(directory) / "run"
+                config = AgentConfig(target=self.url + "reading-center", task="Read the guide.", device=device,
+                                     viewport={"width": width, "height": height}, record_input=True)
+                with patch("agent.engine.MAX_READING_TIME_MS", 1200):
+                    result = await run_agent(config, TestModel(), output, inspect_final=inspect_final)
+                self.assertEqual((result.status, result.steps, result.model_calls, result.answer),
+                                 ("completed", 1, 2 if device == "desktop" else 3, "7:15 a.m."))
+                self.assertNotEqual(views[0], views[1])
+                if device == "mobile":
+                    self.assertEqual(views[1], views[2])
+                agent_events = self.events(output, "agent.jsonl")
+                self.assertEqual([row["activity"] for row in agent_events if row["event"] == "attention_timing"],
+                                 ["thinking", "reading"])
+                position, = [row for row in self.events(output) if row.get("action", {}).get("type") == "center_reading"]
+                inputs = [row["input"] for row in self.events(output, "inputs.jsonl")
+                          if row.get("action_id") == position["action_id"] and row["event"] == "input_event"]
+                expected = "wheel" if device == "desktop" else "touchmove"
+                self.assertTrue(any(item["type"] == expected and item["trusted"] for item in inputs))
+
+    async def test_reading_idles_can_move_the_mouse_and_refresh_without_spending_an_action(self):
+        views = []
+
+        class FastModel:
+            async def decide(self, request):
+                views.append(request.observation.screenshot_png)
+                if len(request.history) < 2:
+                    return ModelReply('{"type":"act","reason":"Read the guide.","action":{"type":"wait","ms":1000}}')
+                return ModelReply('{"type":"stop","outcome":"completed","reason":"Read the opening time."}')
+
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "run"
+            config = AgentConfig(target=self.url + "reading-change", task="Read the guide.", max_steps=2, record_input=True)
+            with (patch("agent.engine.MAX_READING_TIME_MS", 1800),
+                  patch("browser.worker.random", side_effect=[0.0, 1.0, 0.0]),
+                  patch("browser.worker.uniform", side_effect=[0.25, 0.0, 14.0, 0.25, 0.0, 14.0])):
+                result = await run_agent(config, FastModel(), output)
+            self.assertEqual((result.status, result.steps, result.model_calls), ("completed", 2, 4))
+            agent = self.events(output, "agent.jsonl")
+            reading, = [row for row in agent if row.get("activity") == "reading"]
+            self.assertTrue(48 <= reading["visible_words"] < 90)
+            self.assertEqual(reading["target_ms"], 1800)
+            self.assertGreaterEqual(reading["added_wait_ms"], 1600)
+            self.assertTrue(reading["idle_mouse_moved"])
+            self.assertEqual(sum(row["event"] == "decision_superseded" for row in agent), 1)
+            self.assertNotEqual(views[0], views[1])
+            browser = self.events(output)
+            waits = [row for row in browser if row.get("action", {}).get("type") == "wait"]
+            self.assertEqual(len(waits), 2)
+            self.assertTrue(any(row["event"] == "idle_observed" and row["observation"]["screenshot"].startswith("screenshots/idle-")
+                                for row in browser))
+            inputs = self.events(output, "inputs.jsonl")
+            motion = [row for row in inputs if row.get("phase") == "idle" and row["event"] == "input_command"]
+            self.assertTrue(motion and all(row["method"] == "mouse.move" and "action_id" not in row for row in motion))
+            self.assertTrue(all(0 <= row["arguments"][0] <= 22 and row["arguments"][1] == 0 for row in motion))
+            self.assertEqual(motion[-1]["arguments"], [0, 0])
+            wheel_or_click = {"mouse.click", "mouse.wheel"}
+            self.assertFalse(any(row.get("method") in wheel_or_click for row in inputs))
+            self.assertTrue(any(row.get("phase") == "idle" and row.get("input", {}).get("type") == "pointermove"
+                                and row["input"]["trusted"] for row in inputs))
+            self.assertFalse(any(row.get("action_id") == waits[0]["action_id"] for row in inputs))
+            self.assertTrue(any(row.get("action_id") == waits[1]["action_id"] and row.get("method") == "mouse.move"
+                                for row in inputs))
+
+    async def test_mobile_reads_before_answering_with_no_mouse_events(self):
+        class FastModel:
+            async def decide(self, request):
+                return ModelReply('{"type":"stop","outcome":"completed","reason":"Read the guide.","answer":"Seven."}')
+
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "run"
+            config = AgentConfig(target=self.url + "reading", task="Read the guide.", device="mobile",
+                                 viewport={"width": 390, "height": 844}, record_input=True)
+            with patch("agent.engine.MAX_READING_TIME_MS", 1200), patch("browser.worker.random", return_value=0):
+                result = await run_agent(config, FastModel(), output)
+            self.assertEqual((result.status, result.steps, result.answer), ("completed", 0, "Seven."))
+            reading, = [row for row in self.events(output, "agent.jsonl") if row.get("activity") == "reading"]
+            self.assertGreaterEqual(reading["added_wait_ms"], 1100)
+            self.assertFalse(reading["idle_mouse_moved"])
+            self.assertFalse(any(row["event"] == "input_command" for row in self.events(output, "inputs.jsonl")))
+
     def assert_typing_paced(self, events, action_id, text, focus_method, minimum_gap):
         associated = [row for row in events if row.get("action_id") == action_id]
         focus = next(row for row in associated if row.get("method") == focus_method)
@@ -432,7 +587,7 @@ class AgentSmokeTest(LocalSite, unittest.IsolatedAsyncioTestCase):
             async def decide(self, request):
                 decision = next(decisions)
                 if decision.get("action", {}).get("dy") == -210:
-                    await asyncio.sleep(REACTION_TIME_MS[1] / 1000 + 0.05)
+                    await asyncio.sleep(THOUGHT_TIME_MS[1] / 1000 + 0.05)
                 return ModelReply(json.dumps({**decision, "reason": "Scroll inside the box."}))
 
         async def inspect_final(page):
@@ -660,6 +815,39 @@ class AgentSmokeTest(LocalSite, unittest.IsolatedAsyncioTestCase):
             retry = next(call for call in calls if call.retry_feedback)
             self.assertTrue(retry.history[-1].visual_cycle)
             self.assertIn("returned to an earlier screenshot", retry.retry_feedback)
+
+    async def test_repeated_activation_of_clipped_disclosure_positions_answer_before_reading(self):
+        for device, width, height, activation in (("desktop", 1280, 720, "click"), ("mobile", 390, 844, "tap")):
+            with self.subTest(device=device), tempfile.TemporaryDirectory() as directory:
+                class TestModel:
+                    async def decide(self, request):
+                        if request.history and request.history[-1].action.type == "center_reading":
+                            return ModelReply('{"type":"stop","outcome":"completed","reason":"Read the answer.",'
+                                              '"answer":"Seven."}')
+                        return ModelReply(json.dumps({
+                            "type": "act", "reason": "Open the answer.",
+                            "action": {"type": activation, "x": 40, "y": round(height * 0.90) + 12},
+                        }))
+
+                async def inspect_final(page):
+                    bounds = await page.locator("details[open] p").bounding_box()
+                    self.assertIsNotNone(bounds)
+                    self.assertGreaterEqual(bounds["y"], 0)
+                    self.assertLessEqual(bounds["y"] + bounds["height"], height)
+                    self.assertAlmostEqual(bounds["y"] + bounds["height"] / 2, height / 2, delta=height * 0.15)
+
+                output = Path(directory) / "run"
+                config = AgentConfig(target=self.url + "disclosure-edge", task="Read the opening time.", device=device,
+                                     viewport={"width": width, "height": height}, max_steps=3)
+                result = await run_agent(config, TestModel(), output, inspect_final=inspect_final)
+                self.assertEqual((result.status, result.steps, result.model_calls, result.answer),
+                                 ("completed", 2, 3, "Seven."))
+                actions = [row for row in self.events(output) if row["event"] == "action"]
+                self.assertEqual([row["action"]["type"] for row in actions], ["navigate", activation, "center_reading"])
+                adjustment, = [row for row in self.events(output, "agent.jsonl") if row["event"] == "action_adjusted"]
+                self.assertEqual(adjustment["proposed"]["action"], actions[1]["action"])
+                self.assertEqual(adjustment["adjusted"]["action"], actions[2]["action"])
+                self.assertEqual(adjustment["action_id"], actions[2]["action_id"])
 
     async def test_repeated_no_effect_click_gets_a_retry_without_dispatch(self):
         calls = []

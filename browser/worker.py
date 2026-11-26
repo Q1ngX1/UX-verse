@@ -3,8 +3,10 @@ import re
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterable
 from contextlib import asynccontextmanager, nullcontext
 from hashlib import sha256
+from math import cos, sin, tau
 from pathlib import Path
-from time import monotonic
+from random import random, uniform
+from time import monotonic, perf_counter
 from typing import NotRequired, TypedDict
 from urllib.parse import urlsplit
 from uuid import uuid4
@@ -18,7 +20,7 @@ from pydantic import HttpUrl
 from logs import EventSink, RunEvents
 
 from .actions import (
-    MAX_STEPS, Action, Back, Click, FindText, Hover, KeyText, Navigate, PointerAction,
+    MAX_STEPS, Action, Back, CenterReading, Click, FindText, Hover, KeyText, Navigate, PointerAction,
     PressKey, Scroll, Swipe, Tap, TypeText, Wait,
 )
 from .input_devices import (
@@ -32,6 +34,14 @@ from .viewport import Viewport
 ACTION_TIMEOUT = 10
 RUN_TIMEOUT = 90
 CLICK_NAVIGATION_TIMEOUT_MS = 250
+IDLE_MOTION_CHANCE = 0.35
+IDLE_MOTION_MIN_SECONDS = 0.9
+_SCROLL_SETTLED = "() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)))"
+
+
+class ReadingLoad(TypedDict):
+    words: int
+    key: str
 
 
 class ActionEffect(TypedDict):
@@ -62,6 +72,7 @@ class PageObservation(TypedDict):
     effect: NotRequired[ActionEffect]
     controls: NotRequired[list[ControlHint]]
     visible_text: NotRequired[list[str]]
+    reading: NotRequired[ReadingLoad]
 
 
 _IS_EDITABLE = """(point) => {
@@ -123,6 +134,36 @@ _VISIBLE_TEXT = r"""() => {
         if (remaining < 40 || blocks.length === 24) break;
     }
     return blocks;
+}"""
+
+
+_READING_LOAD = r"""() => {
+    const root = document.querySelector('main, [role="main"], #body') || document.body;
+    const selector = 'p, blockquote, pre, li, dd, [role=paragraph], div';
+    const segmenter = new Intl.Segmenter(undefined, {granularity: 'word'});
+    let words = 0, hash = 5381;
+    if (!root) return {words, key: String(hash)};
+    for (const block of [root, ...root.querySelectorAll(selector)]) {
+        if (block.matches('div') ? block.children.length : block.querySelector(selector)) continue;
+        if (block.closest('nav, header, footer, aside, [role=navigation], button, [role=button]') ||
+                !block.checkVisibility({opacityProperty: true, visibilityProperty: true})) continue;
+        const rect = block.getBoundingClientRect();
+        const left = Math.max(0, rect.left), right = Math.min(innerWidth, rect.right);
+        const top = Math.max(0, rect.top), bottom = Math.min(innerHeight, rect.bottom);
+        if (right <= left || bottom <= top ||
+                !block.contains(document.elementFromPoint((left + right) / 2, (top + bottom) / 2))) continue;
+        const text = block.innerText.trim();
+        let count = 0;
+        for (const part of segmenter.segment(text)) if (part.isWordLike) count++;
+        if (count < 12) continue;
+        words += Math.round(count * ((right - left) * (bottom - top)) / (rect.width * rect.height));
+        // Identify the visible portion without returning its text to Python or the model.
+        const first = Math.floor(text.length * (top - rect.top) / rect.height);
+        const last = Math.ceil(text.length * (bottom - rect.top) / rect.height);
+        const visible = text.slice(first, last);
+        for (let i = 0; i < visible.length; ++i) hash = (Math.imul(hash, 33) ^ visible.charCodeAt(i)) >>> 0;
+    }
+    return {words, key: String(hash)};
 }"""
 
 
@@ -232,21 +273,24 @@ class BrowserWorker:
         return cursory_trajectory(start, target, viewport=(viewport["width"], viewport["height"]))
 
     async def _observe(
-        self, step: int, *, action: Action, before_url: str, before_scroll: list[int] | None,
+        self, step: int, *, action: Action | None, before_url: str, before_scroll: list[int] | None,
+        idle_image: bytes | None = None,
     ) -> PageObservation:
         page = self._page
         await page.wait_for_load_state("domcontentloaded")
-        image = await page.screenshot(scale="css", style=HIDE_RECORDING_POINTER if self._recording else None)
+        image = idle_image if idle_image is not None else await self._screenshot()
         title = await page.title()
         url = page.url
         if origin(url) != self._origin:
             raise ValueError(f"Page moved outside the target origin: {url}")
-        screenshot = f"screenshots/{step:03}.png"
+        observation_id = uuid4().hex
+        screenshot = (f"screenshots/idle-{observation_id}.png" if idle_image is not None
+                      else f"screenshots/{step:03}.png")
         path = self._output / screenshot
         path.parent.mkdir(exist_ok=True)
         path.write_bytes(image)
         observation: PageObservation = {
-            "observation_id": uuid4().hex, "url": url, "title": title, "screenshot": screenshot,
+            "observation_id": observation_id, "url": url, "title": title, "screenshot": screenshot,
             "viewport": self.viewport,
         }
         digest = sha256(image).digest()
@@ -278,8 +322,74 @@ class BrowserWorker:
             observation["controls"] = await page.evaluate(_VISIBLE_CONTROLS)
         if self._text_hints:
             observation["visible_text"] = await page.evaluate(_VISIBLE_TEXT)
+        if self._human_input:
+            try:
+                observation["reading"] = await page.evaluate(_READING_LOAD)
+            except Error as error:
+                self._record("reading_unavailable", message=str(error))
         self._previous_visual_hash, self._last_visual_hash = self._last_visual_hash, digest
         return observation
+
+    async def _screenshot(self) -> bytes:
+        return await self._page.screenshot(scale="css", style=HIDE_RECORDING_POINTER if self._recording else None)
+
+    async def _wander(self) -> bool:
+        start = self._mouse.position
+        size = self.viewport
+        for _ in range(4):
+            angle, distance = uniform(0, tau), uniform(6, 22)
+            target = (round(start[0] + cos(angle) * distance), round(start[1] + sin(angle) * distance))
+            if not (0 <= target[0] < size["width"] and 0 <= target[1] < size["height"]):
+                continue
+            points = [start, *(point for point, _ in smooth_trajectory(start, target)),
+                      *(point for point, _ in smooth_trajectory(target, start))]
+            same_surface = await self._page.evaluate("""(points) => {
+                const element = document.elementFromPoint(...points[0]);
+                return element && !element.matches('iframe') &&
+                    points.every(point => document.elementFromPoint(...point) === element);
+            }""", points)
+            if same_surface:
+                await self._mouse.move(*target, trajectory=smooth_trajectory)
+                await self._mouse.move(*start, trajectory=smooth_trajectory)
+                return True
+        return False
+
+    async def _rest(self, seconds: float, *, wander: bool) -> bool:
+        deadline = perf_counter() + seconds
+        moved = False
+        if wander and self._touch is None and seconds >= IDLE_MOTION_MIN_SECONDS and random() < IDLE_MOTION_CHANCE:
+            await asyncio.sleep(seconds * uniform(0.2, 0.55))
+            moved = await self._wander()
+        while (remaining := deadline - perf_counter()) > 0:
+            await asyncio.sleep(remaining)
+        return moved
+
+    async def idle(
+        self, seconds: float, *, page: PageObservation, decision_id: str, reading: bool, wander: bool,
+    ) -> tuple[bool, PageObservation | None]:
+        """Pause outside the action budget and refresh a view that changed while reading."""
+        async with self._lock:
+            if origin(self._page.url) != self._origin:
+                raise ValueError("Page left its target origin before the idle period.")
+            self._active_action = {"decision_id": decision_id, "observation_id": page["observation_id"], "phase": "idle"}
+            if self._recording:
+                self._recording.begin_action(self._active_action)
+            try:
+                moved = await self._rest(seconds, wander=wander and self._page.url == page["url"])
+                if not reading and self._page.url == page["url"]:
+                    return False, None
+                image = await self._screenshot()
+                if sha256(image).digest() == self._last_visual_hash and self._page.url == page["url"]:
+                    return moved, None
+                state = await self._observe(self._step, action=None, before_url=page["url"],
+                                            before_scroll=None, idle_image=image)
+                self._last_observation_id = state["observation_id"]
+                self._record("idle_observed", observation=state)
+                return moved, state
+            finally:
+                if self._recording:
+                    self._recording.end_action()
+                self._active_action = {}
 
     async def _dispatch_input(self, method: str, dispatch: Callable[..., Awaitable[None]], *arguments, **options) -> None:
         if self._recording:
@@ -318,16 +428,29 @@ class BrowserWorker:
                     await self._mouse.move(x, y)
             case Scroll(dx=dx, dy=dy):
                 await self._mouse.wheel(dx, dy)
-                await page.evaluate("""() => new Promise(resolve => {
-                    requestAnimationFrame(() => requestAnimationFrame(() => resolve()));
-                })""")
+                await page.evaluate(_SCROLL_SETTLED)
+            case CenterReading(x=x, y=y):
+                offset = action.vertical_offset(viewport["height"])
+                if not offset:
+                    return
+                if self._touch:
+                    await self._touch.swipe(
+                        (x, y), (x, y - offset), viewport=(viewport["width"], viewport["height"]),
+                    )
+                else:
+                    before_url = page.url
+                    await self._mouse.move(x, y)
+                    if page.url != before_url:
+                        return
+                    await self._mouse.wheel(0, offset)
+                await page.evaluate(_SCROLL_SETTLED)
             case Tap(x=x, y=y) if self._touch:
                 before_url = page.url
                 await self._touch.tap(x, y)
                 await self._wait_for_navigation(before_url)
             case Swipe(x=x, y=y, end_x=end_x, end_y=end_y) if self._touch:
                 await self._touch.swipe((x, y), (end_x, end_y), viewport=(viewport["width"], viewport["height"]))
-                await page.evaluate("() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)))")
+                await page.evaluate(_SCROLL_SETTLED)
             case Back():
                 await page.go_back(wait_until="domcontentloaded")
             case TypeText(x=x, y=y, text=text) if self._touch or typing is not None:
@@ -380,7 +503,9 @@ class BrowserWorker:
                 else:
                     raise ActionRejected("No displayed text matched the query on this page.")
             case Wait(ms=ms):
-                await asyncio.sleep(ms / 1000)
+                moved = await self._rest(ms / 1000, wander=self._human_input)
+                if moved:
+                    self._record("idle_motion", phase="wait", duration_ms=ms)
 
     async def execute(
         self, action: Action, *, action_id: str | None = None, decision_id: str | None = None,

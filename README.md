@@ -261,6 +261,22 @@ The agent and scripted browser share virtual input devices. Desktop mode uses a 
 
 Desktop and mobile agents time each action from when its screenshot is available. The minimum reaction time is sampled between 450 and 700 milliseconds per action, counting model decision time toward it. The agent waits for any remaining time. The `reaction_timing` event in `agent.jsonl` records the target, elapsed time from observation to action, and added wait.
 
+普通动作另有 750–1,100 毫秒的思考目标。视口中约有 48 个词以上的可见正文时，Agent 会为新内容安排更长的阅读停留，最长 10 秒。模型推理时间计入停留，已读的相同页面区域会复用阅读结果。浏览器只计算渲染后的正文量，模型仍根据截图决策。
+
+Ordinary actions also have a thinking target of 750–1,100 milliseconds. When the viewport contains approximately 48 words of visible prose or more, the agent allows up to 10 seconds to read a new view. Model inference counts toward the dwell, and the agent reuses the dwell for the same visible content. The browser measures rendered text volume while the model still makes decisions from screenshots.
+
+Agent 可从截图选定要读的段落、代码示例或表格。如果可见内容的中点偏离视口中央 30% 的区域，会先尝试一次 `center_reading`。桌面端把指针移到内容处并滚动鼠标滚轮，移动端用手指滑动。随后 Agent 根据新截图阅读，页面边界可能限制移动距离。
+
+The agent can pick the paragraph, code example, or table it wants to read from the screenshot. If the midpoint of the visible content falls outside the middle 30% of the viewport, it can first try `center_reading` once. On desktop it moves the pointer to the content and scrolls the mouse wheel. On mobile it swipes. The agent then reads from the fresh screenshot. Page boundaries can limit the movement.
+
+如果视口底部的点击或轻点改变了当前页面的画面，Agent 在原处再次操作前会先把下方区域移到视口中部。这能让它看清刚展开但被视口裁切的内容。`agent.jsonl` 的 `action_adjusted` 事件记录原动作和实际采用的动作。
+
+If a click or tap near the bottom of the viewport changes the view on the same page, the agent brings the area below it toward the middle before activating the same point again. This can reveal newly expanded content cut off by the viewport. The `action_adjusted` event in `agent.jsonl` records the proposed action and the action used instead.
+
+桌面指针通常停在原位。在较长的阅读停顿或显式等待里，指针偶尔在同一页面元素内随机往返约 6–22 个 CSS 像素。若阅读时的移动改变了画面，Agent 会先获取新截图再决策。`attention_timing` 记录思考或阅读用时，`--record-input` 会把阅读时的指针移动标为 `phase: idle`。移动端的阅读停顿保持静止。
+
+The desktop pointer usually stays put. During longer reading pauses or explicit waits, it occasionally moves about 6–22 CSS pixels within the same page element and returns. If movement during a reading pause changes the view, the agent takes a fresh screenshot before deciding again. `attention_timing` records the thinking or reading dwell, and `--record-input` labels pointer movement during reading as `phase: idle`. Mobile reading pauses stay stationary.
+
 启动本地视觉模型后，可运行以下 Waymark 任务。基准测试独立核对结果，并保存 `inputs.jsonl` 和带指针的视频以便检查轨迹。
 
 With the local vision model running, use the following Waymark task. The benchmark independently checks the result and saves `inputs.jsonl` and a video with the pointer for trajectory inspection.

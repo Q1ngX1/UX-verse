@@ -41,6 +41,16 @@ class Scroll(BrowserAction):
     dy: int = 0
 
 
+class CenterReading(PointerAction):
+    """Bring a visible reading point toward the middle of the viewport."""
+
+    type: Literal["center_reading"] = "center_reading"
+
+    def vertical_offset(self, viewport_height: int) -> int:
+        offset = self.y - viewport_height // 2
+        return offset if abs(offset) > viewport_height * 0.15 else 0
+
+
 class TypeText(PointerAction):
     type: Literal["type"] = "type"
     text: Annotated[str, Field(min_length=1, max_length=1000)]
@@ -73,7 +83,7 @@ class Wait(BrowserAction):
 
 
 Action = Annotated[
-    Navigate | Click | Hover | Tap | Swipe | Scroll | TypeText | Back | PressKey | FindText | Wait,
+    Navigate | Click | Hover | Tap | Swipe | Scroll | CenterReading | TypeText | Back | PressKey | FindText | Wait,
     Field(discriminator="type"),
 ]
 MAX_STEPS = 30

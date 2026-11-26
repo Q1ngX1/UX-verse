@@ -116,13 +116,14 @@ class VirtualMouse:
         await self._dispatch("mouse.move", self._backend.move, *point)
         self.position = point
 
-    async def move(self, x: int, y: int) -> None:
+    async def move(self, x: int, y: int, *, trajectory: Trajectory | None = None) -> None:
         target = (x, y)
-        if self._trajectory is None:
+        path = trajectory or self._trajectory
+        if path is None:
             await self._move(target)
             return
         if target != self.position:
-            async for point in _pace(self._trajectory(self.position, target)):
+            async for point in _pace(path(self.position, target)):
                 if point != self.position:
                     await self._move(point)
             if target != self.position:

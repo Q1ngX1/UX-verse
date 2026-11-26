@@ -3,13 +3,13 @@ from typing import Annotated, Literal, Protocol
 
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter
 
-from browser.actions import Click, Hover, KeyText, PressKey, Scroll, Swipe, Tap, Wait
+from browser.actions import CenterReading, Click, Hover, KeyText, PointerAction, PressKey, Scroll, Swipe, Tap, Wait
 from browser.input_devices import Device
 from models.contracts import ModelError as ModelError, ModelUsage as ModelUsage, RetryableModelError as RetryableModelError
 
 Mode = Literal["task", "explore"]
-DesktopAction = Annotated[Click | Hover | Scroll | KeyText | PressKey | Wait, Field(discriminator="type")]
-MobileAction = Annotated[Tap | Swipe | KeyText | Wait, Field(discriminator="type")]
+DesktopAction = Annotated[Click | Hover | Scroll | CenterReading | KeyText | PressKey | Wait, Field(discriminator="type")]
+MobileAction = Annotated[Tap | Swipe | CenterReading | KeyText | Wait, Field(discriminator="type")]
 ExplorerAction = DesktopAction | MobileAction
 
 
@@ -28,6 +28,7 @@ class Stop(DecisionBase):
     type: Literal["stop"]
     outcome: Literal["completed", "gave_up"]
     answer: Annotated[str, Field(min_length=1, max_length=1000)] | None = None
+    reading_point: PointerAction | None = None
 
 
 class DesktopAct(Act):
